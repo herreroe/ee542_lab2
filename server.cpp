@@ -79,26 +79,7 @@ int main() {
         if (packet.type == PACKET_START) {
             std::cout << "Received START packet." << std::endl;
 
-            std::string filename(
-                packet.data,
-                packet.data + packet.data_length
-            );
-
-            std::cout
-                << "Filename: "
-                << filename
-                << std::endl;
-
-
-            outputFile.open("received_file", std::ios::binary);
-
-            if (!outputFile.is_open()) {
-                std::cerr
-                    << "Could not open output file."
-                    << std::endl;
-
-                break;
-            }
+            // open proper file
 
             receivingFile = true;
 
@@ -112,13 +93,7 @@ int main() {
                 std::cerr<< "Received DATA before START." << std::endl;
                 continue;
             }
-
-            outputFile.write(packet.data, packet.data_length);
-
-            if (!outputFile) {
-                std::cerr << "Error writing file." << std::endl;
-                break;
-            }
+             // wite to output file
 
             std::cout << "Received packet " << packet.sequence << " (" << packet.data_length  << " bytes)" << std::endl;
         }
@@ -126,10 +101,7 @@ int main() {
         else if (packet.type == PACKET_END) {
             std::cout << "Received END packet." << std::endl;
 
-            if (outputFile.is_open()) {
-                outputFile.close();
-            }
-
+           // save stuff
             receivingFile = false;
             std::cout << "File transfer complete."  << std::endl;
             break;
