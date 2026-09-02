@@ -53,14 +53,15 @@ int main() {
     sockaddr_in clientAddress{};
     socklen_t clientAddressLength = sizeof(clientAddress);
 
-    std::ofstream outputFile;
+    // std::ofstream outputFile;
+    FILE * outputFile = NULL;
 
     bool receivingFile = false;
 
 
     while (true)
     {
-        ssize_t bytesReceived = recvfrom(
+        ssize_t n = recvfrom(
             sockfd,
             &packet,
             sizeof(packet),
@@ -70,7 +71,7 @@ int main() {
         );
 
 
-        if (bytesReceived < 0) {
+        if (n < 0) {
             perror("recvfrom");
             break;
         }
@@ -79,9 +80,15 @@ int main() {
         if (packet.type == PACKET_START) {
             std::cout << "Received START packet." << std::endl;
 
-            // open proper file
+            std::string filename(packet.data, packet.data_length);
 
-            receivingFile = true;
+            outputFile = fopen(filename.c_str(), "wb");
+            if (outputFile == NULL) {
+                perror("Failed to open output file");
+                receivingFile = false;
+            } else {
+                receivingFile = true;
+            }
 
             std::cout
                 << "Opened received_file for writing."
@@ -92,8 +99,17 @@ int main() {
             if (!receivingFile) {
                 std::cerr<< "Received DATA before START." << std::endl;
                 continue;
+
             }
-             // wite to output file
+
+            size_t bytesWritten = fwrite(packet.data, 1, packet.data_length, outputFile);
+            if (bytesWritten != packet.data_length) {
+                std::cerr << "Failed to write all data" << std::endl;
+                fclose(outputFile);
+                outputFile = NULL;
+                receivingFile = false;
+                break;
+            }
 
             std::cout << "Received packet " << packet.sequence << " (" << packet.data_length  << " bytes)" << std::endl;
         }
@@ -102,6 +118,10 @@ int main() {
             std::cout << "Received END packet." << std::endl;
 
            // save stuff
+            if (outputFile != NULL) {
+                fclose(outputFile);
+                outputFile = NULL;
+            }
             receivingFile = false;
             std::cout << "File transfer complete."  << std::endl;
             break;
@@ -114,8 +134,8 @@ int main() {
         }
     }
 
-    if (outputFile.is_open()) {
-        outputFile.close();
+    if (outputFile != NULL) {
+        fclose(outputFile);
     }
 
     close(sockfd);

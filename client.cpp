@@ -13,13 +13,19 @@
 #include <cstdlib>
 
 #include "zap_protocol.hpp"
+#include "zap_cli.hpp"
 
 
-int main() {
+int main(int argc, char* argv[]) {
+    Args args;
+    if (!parse_args(argc, argv, &args)) {
+        return EXIT_FAILURE;
+    }
+
     int sockfd;
-    char* serverIP, filename;
+    const char* serverIP = args.ip_address.c_str();
+    const char* filename = args.file_path.c_str();
     struct sockaddr_in servaddr;
-    // TODO: Combine the work from isabel with this  to get the actrual ip and filenames. 
     std::ifstream inputFile(filename, std::ios::binary);
 
     if (!inputFile.is_open()){
@@ -43,7 +49,7 @@ int main() {
 
     // Fill server address info
     servaddr.sin_family = AF_INET;              // IPv4
-    servaddr.sin_port   = htons(SERVER_PORT);          // Server port
+    servaddr.sin_port   = htons(args.port);          // Server port
 
     // checkk server addr
     if (inet_pton(AF_INET, serverIP,  &servaddr.sin_addr ) <= 0) {
@@ -66,17 +72,17 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    std::cout << "UDP socket connected to " << serverIP << ":" << SERVER_PORT << std::endl;
+    std::cout << "UDP socket connected to " << serverIP << ":" << args.port << std::endl;
 
     Packet packet{};
 
     packet.type = PACKET_START;
-    packet.sequence = 0; // TODO
+    packet.sequence = 0;
 
-    packet.data_length = strlen(filename);
+    std::string savePath = args.save_dir.empty() ? args.file_path : args.save_dir;
+    packet.data_length = savePath.size();
 
-
-    if (packet.data_length >= FILENAME_SIZE) {// check filename 
+    if (packet.data_length == 0 || packet.data_length >= FILENAME_SIZE) {// check filename 
         std::cerr << "Filename is too long." << std::endl;
         inputFile.close();
         close(sockfd);
@@ -84,7 +90,7 @@ int main() {
     }
 
     // copy to data
-    memcpy( packet.data,  filename, packet.data_length );
+    memcpy( packet.data,  savePath.c_str(), packet.data_length );
     // send data
     ssize_t bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
 

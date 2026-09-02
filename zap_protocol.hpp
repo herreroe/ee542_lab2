@@ -1,10 +1,8 @@
 #ifndef ZAP_PROTOCOL_HPP
 #define ZAP_PROTOCOL_HPP
-
 #include <cstdint>
 
-constexpr uint16_t SERVER_PORT = 5000;
-
+constexpr uint16_t SERVER_PORT = 8080;
 constexpr uint32_t DATA_SIZE = 1024;
 constexpr uint32_t FILENAME_SIZE = 256;
 

@@ -1,5 +1,7 @@
 // zap client
 // zap myfile.txt 192.168.1.1 -o /path/to/save
+#ifndef ZAP_CLI_HPP
+#define ZAP_CLI_HPP
 
 #include <iostream>
 #include <string>
@@ -67,16 +69,4 @@ static bool parse_args(int argc, char* argv[], Args* out) {
     return true;
 }
 
-int main(int argc, char* argv[]) {
-    Args args;
-    if (!parse_args(argc, argv, &args)) {
-        return 1;
-    }
-
-    cout << "File: " << args.file_path << endl;
-    cout << "IP Address: " << args.ip_address << endl;
-    cout << "Save Directory: " << (args.save_dir.empty() ? "Not specified" : args.save_dir) << endl;
-    cout << "Port: " << args.port << endl;
-
-    return 0;
-}
+#endif
