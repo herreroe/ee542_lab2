@@ -1,0 +1,8 @@
+data.bin
+server
+client
+zap
+*.o
+*.obj
+*.exe
+*.out
