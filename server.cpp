@@ -116,7 +116,7 @@ int main() {
             // duplicate packet check
             // if sequence number is already in the set, drop this copy and keep original
             if (receivedSequences.find(packet.sequence) != receivedSequences.end()) {
-                std::cout << "Received duplicate packet " << packet.sequence << " received - dropping (original kept)" << std::endl;
+                // std::cout << "Received duplicate packet " << packet.sequence << " received - dropping (original kept)" << std::endl;
                 continue;
             }
 
