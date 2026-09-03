@@ -57,12 +57,13 @@ int main() {
     FILE * outputFile = NULL;
 
     bool receivingFile = false;
+    std::unordered_set<uint32_t> receivedSequences;
 
  // notes: we should probs move the packet_start outside so that it must send an ack to confirm file can be sent. 
     // Then while loop for as long as it takes to recv all of the packets. then send an fin message - might be able to do away with the 
     // "PACKET_END" as in once all of the data from the file is sent and acked fully/
     // PACKET_START will likely need to specify how large the size of the file to be sent is - so the receiver can know how many packets to expect,etc
-    while (true) 
+    
     while (true)
     {
         ssize_t n = recvfrom(
@@ -84,6 +85,8 @@ int main() {
         if (packet.type == PACKET_START) {
             std::cout << "Received START packet." << std::endl;
 
+            receivedSequences.clear();
+            
             std::string filename(packet.data, packet.data_length);
 
             outputFile = fopen(filename.c_str(), "wb");
@@ -106,6 +109,8 @@ int main() {
 
             }
 
+            receivedSequences.insert(packet.sequence);
+
             size_t bytesWritten = fwrite(packet.data, 1, packet.data_length, outputFile);
             if (bytesWritten != packet.data_length) {
                 std::cerr << "Failed to write all data" << std::endl;
@@ -123,6 +128,33 @@ int main() {
             std::cout << "Received END packet." << std::endl;
 
            // save stuff
+           uint32_t totalPackets = packet.sequence;
+           std::vector<uint32_t> missingPackets;
+           for (uint32_t seq = 0; seq < totalPackets; ++seq) {
+            if (receivedSequences.find(seq) == receivedSequences.end()) {
+                missingPackets.push_back(seq);
+            }
+        }
+
+           std::cout << "Expected DATA packets: "
+                     << totalPackets << std::endl;
+
+           std::cout << "Received DATA packets: "
+                     << receivedSequences.size() << std::endl;
+
+           std::cout << "Missing DATA packets: "
+                     << missingPackets.size() << std::endl;
+
+           if (!missingPackets.empty()) {
+               std::cout << "Missing sequence numbers: ";
+
+               for (uint32_t seq : missingPackets) {
+                std::cout << seq << " ";
+                }
+
+                std::cout << std::endl;
+            }
+            
             if (outputFile != NULL) {
                 fclose(outputFile);
                 outputFile = NULL;
