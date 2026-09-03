@@ -128,12 +128,20 @@ int main(int argc, char* argv[]) {
         dataPacket.data_length = static_cast<uint32_t>(bytesRead);
 
         // Send packet
-        bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
+        for(int i = 0; i < 10; i++) {
+            bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
 
-        if (bytesSent < 0) { 
-            perror("send");
-            break;
+            if (bytesSent < 0) { 
+                perror("send");
+                break;
+            }
         }
+        // bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
+
+        // if (bytesSent < 0) { 
+        //     perror("send");
+        //     break;
+        // }
 
        if (sequence %100 == 0) {
             std::cout << "Sent packet "  << sequence << " ("  << bytesRead << " bytes)" << std::endl;
