@@ -96,8 +96,9 @@ int main(int argc, char* argv[]) {
     // copy to data
     memcpy( packet.data,  savePath.c_str(), packet.data_length );
     // send data
+    ssize_t bytesSent;
     for(int i = 0; i < 5; i++) {  // send 5 times
-        ssize_t bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
+        bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
 
         if (bytesSent < 0) {
             perror("send");
