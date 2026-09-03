@@ -87,6 +87,9 @@ int main() {
 
         // Start msg
         if (packet.type == PACKET_START) {
+            if(receivingFile) { // if we already have the start packet.
+                continue;
+            }
             std::cout << "Received START packet." << std::endl;
 
             receivedSequences.clear();

@@ -78,8 +78,8 @@ int main(int argc, char* argv[]) {
 
     std::cout << "UDP socket connected to " << serverIP << ":" << args.port << std::endl;
 
+    // SEND START
     Packet packet{};
-
     packet.type = PACKET_START;
     packet.sequence = 0;
 
@@ -96,13 +96,15 @@ int main(int argc, char* argv[]) {
     // copy to data
     memcpy( packet.data,  savePath.c_str(), packet.data_length );
     // send data
-    ssize_t bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
+    for(int i = 0; i < 5; i++) {  // send 5 times
+        ssize_t bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
 
-    if (bytesSent < 0) {
-        perror("send");
-        inputFile.close();
-        close(sockfd);
-        return EXIT_FAILURE;
+        if (bytesSent < 0) {
+            perror("send");
+            inputFile.close();
+            close(sockfd);
+            return EXIT_FAILURE;
+        }
     }
 
     std::cout << "START packet sent." << std::endl;
@@ -150,22 +152,21 @@ int main(int argc, char* argv[]) {
     }
 
 
-    // end msg
+    // SEND END msg
     Packet endPacket{}; 
-
     endPacket.type = PACKET_END;
     endPacket.sequence = sequence;
     endPacket.data_length = 0;
 
-
-    bytesSent = send( sockfd, &endPacket, sizeof(endPacket), 0);
-
-    if (bytesSent < 0) { 
+    for(int i = 0; i < 5; i++) {
+        bytesSent = send( sockfd, &endPacket, sizeof(endPacket), 0);
+        if (bytesSent < 0) { 
         perror("send");
+        }
     }
-    else{
-        std::cout << "END packet sent." << std::endl;
-    }
+
+    std::cout << "END packet sent." << std::endl;
+
 
     // cleanup
     inputFile.close();
