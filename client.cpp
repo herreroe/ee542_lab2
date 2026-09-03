@@ -135,7 +135,7 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-       if (sequence %100) {
+       if (sequence %100 == 0) {
             std::cout << "Sent packet "  << sequence << " ("  << bytesRead << " bytes)" << std::endl;
         }
         sequence++;

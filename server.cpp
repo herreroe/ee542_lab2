@@ -30,6 +30,10 @@ int main() {
         exit(EXIT_FAILURE); 
     } 
     std::cout << "UDP socket created." << std::endl;
+
+    // added bc no flow control or ACKs yet
+    int rcvbuf = 32 * 1024 * 1024;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
   
     memset(&servaddr, 0, sizeof(servaddr)); 
     memset(&cliaddr, 0, sizeof(cliaddr)); 
@@ -109,7 +113,20 @@ int main() {
 
             }
 
-            receivedSequences.insert(packet.sequence);
+            // duplicate packet check
+            // if sequence number is already in the set, drop this copy and keep original
+            if (receivedSequences.find(packet.sequence) != receivedSequences.end()) {
+                std::cout << "Received duplicate packet " << packet.sequence << " received - dropping (original kept)" << std::endl;
+                continue;
+            }
+
+            // order by sequence number
+            // seek where the chunk belongs in the file before writing it
+            long offset = static_cast<long>(packet.sequence) * static_cast<long>(DATA_SIZE);
+            if (fseek(outputFile, offset, SEEK_SET) != 0) {
+                perror("fseek");
+                continue;
+            }
 
             size_t bytesWritten = fwrite(packet.data, 1, packet.data_length, outputFile);
             if (bytesWritten != packet.data_length) {
@@ -119,6 +136,9 @@ int main() {
                 receivingFile = false;
                 break;
             }
+
+            receivedSequences.insert(packet.sequence);
+
             if (packet.sequence %100 == 0) {
                 std::cout << "Received packet " << packet.sequence << " (" << packet.data_length  << " bytes)" << std::endl;
             }
