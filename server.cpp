@@ -19,6 +19,7 @@
 #include <vector>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 
 #include "zap_protocol.hpp"
 
@@ -31,6 +32,7 @@ struct ReceiverState {
 
     std::atomic<bool> stopRequested{false};
     std::atomic<uint32_t> finalTotalPackets{0};
+    std::chrono::high_resolution_clock::time_point finalRecvTime;
 };
 
 static void receiver_thread(ReceiverState& state, int threadIndex) {
@@ -162,9 +164,11 @@ int optval = 1;
         }
         // end msg
         else if (packet.type == PACKET_END) {
+            auto recv_time = std::chrono::high_resolution_clock::now();
             std::cout << "[thread " << threadIndex << "] Received END packet." << std::endl;
             state.finalTotalPackets.store(packet.sequence);
             state.stopRequested.store(true);
+            state.finalRecvTime = recv_time;
         }
         else {
             std::cerr << "[thread " << threadIndex << "] Unknown packet type: " << packet.type << std::endl;
@@ -217,6 +221,9 @@ int main() {
     }
 
     std::cout << "File transfer complete." << std::endl;
+
+    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(state.finalRecvTime.time_since_epoch()).count();
+    std::cout << "Timestamp (Final bit received): " << duration_us << " us (epoch)" << std::endl;
 
     return 0;
 

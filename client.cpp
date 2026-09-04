@@ -198,6 +198,9 @@ int main(int argc, char* argv[]) {
 
     // copy to data
     memcpy( packet.data,  savePath.c_str(), packet.data_length );
+
+    auto firstBitSentTime = std::chrono::high_resolution_clock::now();
+
     // send data
     ssize_t bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
 
@@ -206,6 +209,9 @@ int main(int argc, char* argv[]) {
         close(sockfd);
         return EXIT_FAILURE;
     }
+
+    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(firstBitSentTime.time_since_epoch()).count();
+    std::cout << "Timestamp (First bit sent): " << duration_us << " us (epoch)" << std::endl;
 
     std::cout << "START packet sent." << std::endl;
 
@@ -251,7 +257,6 @@ int main(int argc, char* argv[]) {
 
     // cleanup
     close(sockfd);
-
 
     std::cout << "File transfer complete." << std::endl;
 
