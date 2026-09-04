@@ -37,6 +37,61 @@ struct ReceiverState {
     std::atomic<uint32_t> finalTotalPackets{0};
 };
 
+static bool send_nack_packets(
+    const std::vector<uint32_t>& missingPackets,
+    const sockaddr_in& clientAddress)
+{
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("socket creation failed (NACK)");
+        return false;
+    }
+
+    constexpr size_t MAX_SEQS_PER_NACK =
+        DATA_SIZE / sizeof(uint32_t);
+
+    for (size_t i = 0; i < missingPackets.size(); i += MAX_SEQS_PER_NACK) {
+        Packet nackPacket{};
+        nackPacket.type = PACKET_NACK;
+
+        size_t count = std::min(
+            MAX_SEQS_PER_NACK,
+            missingPackets.size() - i
+        );
+
+        memcpy(
+            nackPacket.data,
+            missingPackets.data() + i,
+            count * sizeof(uint32_t)
+        );
+
+        nackPacket.data_length =
+            static_cast<uint32_t>(count * sizeof(uint32_t));
+
+        ssize_t bytesSent = sendto(
+            sockfd,
+            &nackPacket,
+            sizeof(nackPacket),
+            0,
+            reinterpret_cast<const sockaddr*>(&clientAddress),
+            sizeof(clientAddress)
+        );
+
+        if (bytesSent < 0) {
+            perror("sendto NACK");
+            close(sockfd);
+            return false;
+        }
+
+        std::cout << "Sent NACK for "
+                  << count
+                  << " missing packets." << std::endl;
+    }
+
+    close(sockfd);
+    return true;
+}
+
 static void receiver_thread(ReceiverState& state, int threadIndex) {
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
@@ -211,12 +266,29 @@ int main() {
     std::cout << "Received DATA packets: " << state.receivedSequences.size() << std::endl;
     std::cout << "Missing DATA packets: " << missingPackets.size() << std::endl;
 
-    if (!missingPackets.empty()) {
+        if (!missingPackets.empty()) {
         std::cout << "Missing sequence numbers: ";
         for (uint32_t seq : missingPackets) {
             std::cout << seq << " ";
         }
         std::cout << std::endl;
+
+        if (state.clientAddressKnown) {
+            sockaddr_in clientAddr;
+
+            {
+                std::lock_guard<std::mutex> lock(state.clientMutex);
+                clientAddr = state.clientAddress;
+            }
+
+            if (!send_nack_packets(missingPackets, clientAddr)) {
+                std::cerr << "Failed to send NACK packets." << std::endl;
+            }
+        }
+        else {
+            std::cerr << "Cannot send NACK: client address is unknown."
+                      << std::endl;
+        }
     }
 
     if (state.outputFile != nullptr) {
@@ -226,5 +298,4 @@ int main() {
     std::cout << "File transfer complete." << std::endl;
 
     return 0;
-
 }
