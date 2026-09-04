@@ -92,17 +92,17 @@ static bool send_chunk(const std::string& filename,
                 perror("send (thread)");
                 break;
             }
+             next_send_time += packet_interval;
+            while (std::chrono::high_resolution_clock::now() < next_send_time) {
+                #if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause();
+                #endif
+            }
         }
 
         bytesRemaining -= static_cast<uint64_t>(bytesRead);
         sequence++;
-
-        next_send_time += packet_interval;
-        while (std::chrono::high_resolution_clock::now() < next_send_time) {
-            #if defined(__x86_64__) || defined(_M_X64)
-            __builtin_ia32_pause(); // Efficient CPU pause instruction during spin wait
-            #endif
-        }
+       
     }
 
     {
@@ -154,7 +154,7 @@ int main(int argc, char* argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    int bufsize = 16 * 1024 * 1024; // 16MB .. can increase/decrease this
+    int bufsize = 0.4 * 1024 * 1024; // 16MB .. can increase/decrease this
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 
