@@ -7,7 +7,7 @@ constexpr uint32_t DATA_SIZE = 1024;
 constexpr uint32_t FILENAME_SIZE = 256;
 
 // number of threads used on both client and server side
-constexpr int NUM_THREADS = 4;
+constexpr int NUM_THREADS = 2;
 
 // Packet types
 constexpr uint32_t PACKET_START = 1;

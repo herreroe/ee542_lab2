@@ -16,6 +16,7 @@
 #include <vector>
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 
 #include "zap_protocol.hpp"
 #include "zap_cli.hpp"
@@ -62,6 +63,17 @@ static bool send_chunk(const std::string& filename,
     uint32_t sequence = startSeq;
     uint64_t bytesRemaining = endOffset - startOffset;
 
+    constexpr double TOTAL_TARGET_BPS = 95.0 * 1000.0 * 1000.0;
+    const double thread_target_bps = TOTAL_TARGET_BPS / static_cast<double>(NUM_THREADS);
+    const double bits_per_packet = sizeof(Packet) * 8.0;
+    
+    // Calculate the inter-packet delay needed for THIS thread
+    const auto packet_interval = std::chrono::nanoseconds(
+        static_cast<long long>((bits_per_packet / thread_target_bps) * 1e9)
+    );
+
+    auto next_send_time = std::chrono::high_resolution_clock::now();
+
     while (bytesRemaining > 0) {
         Packet dataPacket{};
         dataPacket.type = PACKET_DATA;
@@ -82,6 +94,13 @@ static bool send_chunk(const std::string& filename,
 
         bytesRemaining -= static_cast<uint64_t>(bytesRead);
         sequence++;
+
+        next_send_time += packet_interval;
+        while (std::chrono::high_resolution_clock::now() < next_send_time) {
+            #if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause(); // Efficient CPU pause instruction during spin wait
+            #endif
+        }
     }
 
     {
@@ -133,6 +152,10 @@ int main(int argc, char* argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    int bufsize = 16 * 1024 * 1024; // 16MB .. can increase/decrease this
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+
     std::cout << "UDP socket created."  << std::endl;
 
     memset(&servaddr, 0, sizeof(servaddr));
@@ -143,12 +166,8 @@ int main(int argc, char* argv[]) {
 
     // checkk server addr
     if (inet_pton(AF_INET, serverIP,  &servaddr.sin_addr ) <= 0) {
-        std::cerr
-            << "Invalid server IP address: "
-            << serverIP
-            << std::endl;
+        std::cerr << "Invalid server IP address: " << serverIP << std::endl;
         close(sockfd);
-
         return EXIT_FAILURE;
     }
 
