@@ -1,4 +1,4 @@
-all: zap server
+all: zap server client
 
 zap: client.cpp zap_protocol.hpp zap_cli.hpp
 	g++ -std=c++17 -o zap client.cpp

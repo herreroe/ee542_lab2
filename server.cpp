@@ -62,7 +62,6 @@ int main() {
     // Then while loop for as long as it takes to recv all of the packets. then send an fin message - might be able to do away with the 
     // "PACKET_END" as in once all of the data from the file is sent and acked fully/
     // PACKET_START will likely need to specify how large the size of the file to be sent is - so the receiver can know how many packets to expect,etc
-    while (true) 
     while (true)
     {
         ssize_t n = recvfrom(
