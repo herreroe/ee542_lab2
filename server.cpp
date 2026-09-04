@@ -29,6 +29,10 @@ int main() {
         perror("socket creation failed"); 
         exit(EXIT_FAILURE); 
     } 
+
+    int bufsize = 16 * 1024 * 1024; // 16MB ... can increase/decrease this
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
     std::cout << "UDP socket created." << std::endl;
   
     memset(&servaddr, 0, sizeof(servaddr)); 
