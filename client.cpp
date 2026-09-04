@@ -11,6 +11,8 @@
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
+#include <thread> 
 
 #include "zap_protocol.hpp"
 #include "zap_cli.hpp"
@@ -59,13 +61,8 @@ int main(int argc, char* argv[]) {
     servaddr.sin_family = AF_INET;              // IPv4
     servaddr.sin_port   = htons(args.port);          // Server port
 
-    // checkk server addr
-    if (inet_pton(AF_INET, serverIP,  &servaddr.sin_addr ) <= 0) {
-        std::cerr
-            << "Invalid server IP address: "
-            << serverIP
-            << std::endl;
-
+    if (inet_pton(AF_INET, serverIP, &servaddr.sin_addr) <= 0) {
+        std::cerr << "Invalid server IP address: " << serverIP << std::endl;
         inputFile.close();
         close(sockfd);
 
@@ -83,7 +80,6 @@ int main(int argc, char* argv[]) {
     std::cout << "UDP socket connected to " << serverIP << ":" << args.port << std::endl;
 
     Packet packet{};
-
     packet.type = PACKET_START;
     packet.sequence = 0;
 
@@ -111,10 +107,16 @@ int main(int argc, char* argv[]) {
 
     std::cout << "START packet sent." << std::endl;
 
+    constexpr double TARGET_BPS = 70.0 * 1000.0 * 1000.0;
+    constexpr double BITS_PER_PACKET = sizeof(Packet) * 8.0;
+    const auto packet_interval = std::chrono::nanoseconds(
+        static_cast<long long>((BITS_PER_PACKET / TARGET_BPS) * 1e9)
+    );
 
-    // send file 
     uint32_t sequence = 0;
+    auto next_send_time = std::chrono::high_resolution_clock::now();
 
+    // Send file payload
     while (true)
     {
         Packet dataPacket{};
@@ -143,11 +145,18 @@ int main(int argc, char* argv[]) {
             std::cout << "Sent packet "  << sequence << " ("  << bytesRead << " bytes)" << std::endl;
         }
         sequence++;
+
+        // Pace transmission to prevent buffer overflow
+        next_send_time += packet_interval;
+        while (std::chrono::high_resolution_clock::now() < next_send_time) {
+            #if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause(); // Saves CPU execution pipeline stalls during spin-wait
+            #endif
+        }
     }
 
-
     // end msg
-    Packet endPacket{}; 
+    Packet endPacket{};
 
     endPacket.type = PACKET_END;
     endPacket.sequence = sequence;
@@ -159,7 +168,7 @@ int main(int argc, char* argv[]) {
     if (bytesSent < 0) { 
         perror("send");
     }
-    else{
+    else {
         std::cout << "END packet sent." << std::endl;
     }
 
