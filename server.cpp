@@ -29,6 +29,10 @@ struct ReceiverState {
     bool receivingFile = false;
     std::unordered_set<uint32_t> receivedSequences;
 
+    std::mutex clientMutex;
+    sockaddr_in clientAddress{};
+    bool clientAddressKnown = false;
+
     std::atomic<bool> stopRequested{false};
     std::atomic<uint32_t> finalTotalPackets{0};
 };
@@ -160,6 +164,12 @@ int optval = 1;
         // end msg
         else if (packet.type == PACKET_END) {
             std::cout << "[thread " << threadIndex << "] Received END packet." << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(state.clientMutex);
+                state.clientAddress = clientAddress;
+                state.clientAddressKnown = true;
+            }
+
             state.finalTotalPackets.store(packet.sequence);
             state.stopRequested.store(true);
         }

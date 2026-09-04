@@ -13,6 +13,8 @@ constexpr int NUM_THREADS = 4;
 constexpr uint32_t PACKET_START = 1;
 constexpr uint32_t PACKET_DATA  = 2;
 constexpr uint32_t PACKET_END   = 3;
+constexpr uint32_t PACKET_NACK  = 4;
+constexpr uint32_t PACKET_COMPLETE = 5;
 
 struct Packet
 {
