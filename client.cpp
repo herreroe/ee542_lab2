@@ -107,7 +107,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "START packet sent." << std::endl;
 
-    constexpr double TARGET_BPS = 70.0 * 1000.0 * 1000.0;
+    constexpr double TARGET_BPS = 30.0 * 1000.0 * 1000.0;
     constexpr double BITS_PER_PACKET = sizeof(Packet) * 8.0;
     const auto packet_interval = std::chrono::nanoseconds(
         static_cast<long long>((BITS_PER_PACKET / TARGET_BPS) * 1e9)
