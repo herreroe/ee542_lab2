@@ -12,8 +12,89 @@
 #include <cstring>
 #include <cstdlib>
 
+#include <thread>
+#include <vector>
+#include <mutex>
+#include <algorithm>
+
 #include "zap_protocol.hpp"
 #include "zap_cli.hpp"
+
+static std::mutex g_coutMutex;
+
+static bool send_chunk(const std::string& filename,
+                        const std::string& serverIP,
+                        int port,
+                        uint64_t startOffset,
+                        uint64_t endOffset,
+                        uint32_t startSeq,
+                        int threadIndex) {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("socket creation failed (thread)");
+        return false;
+    }
+
+    struct sockaddr_in servaddr{};
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(port);
+    if (inet_pton(AF_INET, serverIP.c_str(), &servaddr.sin_addr) <= 0) {
+        std::cerr << "Invalid server IP address in thread " << threadIndex << std::endl;
+        close(sockfd);
+        return false;
+    }
+
+    if (connect(sockfd, reinterpret_cast<sockaddr*>(&servaddr), sizeof(servaddr)) < 0) {
+        perror("connect (thread)");
+        close(sockfd);
+        return false;
+    }
+
+    std::ifstream file(filename, std::ios::binary);
+
+    if (!file.is_open()) {
+        std::cerr << "Thread " << threadIndex << " could not open file" << std::endl;
+        close(sockfd);
+        return false;
+    }
+    file.seekg(static_cast<std::streamoff>(startOffset));
+
+    uint32_t sequence = startSeq;
+    uint64_t bytesRemaining = endOffset - startOffset;
+
+    while (bytesRemaining > 0) {
+        Packet dataPacket{};
+        dataPacket.type = PACKET_DATA;
+        dataPacket.sequence = sequence;
+
+        uint32_t toRead = static_cast<uint32_t>(std::min<uint64_t>(DATA_SIZE, bytesRemaining));
+        file.read(dataPacket.data, toRead);
+        std::streamsize bytesRead = file.gcount();
+        if (bytesRead <= 0) break;
+
+        dataPacket.data_length = static_cast<uint32_t>(bytesRead);
+
+        ssize_t bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
+        if (bytesSent < 0) {
+            perror("send (thread)");
+            break;
+        }
+
+        bytesRemaining -= static_cast<uint64_t>(bytesRead);
+        sequence++;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_coutMutex);
+        std::cout << "Thread " << threadIndex << " sent packets ["
+                  << startSeq << ", " << sequence << ")" << std::endl;
+    }
+
+    file.close();
+    close(sockfd);
+    return true;
+}
+
 // TODO: 
 // notes: we should probs move the packet_start outside so that it must send an ack to confirm file can be sent. 
 // Then while loop for as long as it takes to recv all of the packets. then send an fin message - might be able to do away with the 
@@ -39,11 +120,16 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Opened file: " << filename << std::endl;
 
+     // figure out the file size so we can split it into chunks
+    inputFile.seekg(0, std::ios::end);
+    uint64_t fileSize = static_cast<uint64_t>(inputFile.tellg());
+    inputFile.seekg(0, std::ios::beg);
+    uint32_t totalPackets = static_cast<uint32_t>((fileSize + DATA_SIZE - 1) / DATA_SIZE);
+
     // Create UDP socket
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("socket creation failed");
-        inputFile.close(); // close file here 
         exit(EXIT_FAILURE);
     }
 
@@ -61,8 +147,6 @@ int main(int argc, char* argv[]) {
             << "Invalid server IP address: "
             << serverIP
             << std::endl;
-
-        inputFile.close();
         close(sockfd);
 
         return EXIT_FAILURE;
@@ -71,7 +155,6 @@ int main(int argc, char* argv[]) {
     // connect UDP socket tyo server
     if (connect(sockfd, reinterpret_cast<sockaddr*>(&servaddr), sizeof(servaddr)) < 0) {
         perror("connect");
-        inputFile.close();
         close(sockfd);
         return EXIT_FAILURE;
     }
@@ -88,7 +171,6 @@ int main(int argc, char* argv[]) {
 
     if (packet.data_length == 0 || packet.data_length >= FILENAME_SIZE) {// check filename 
         std::cerr << "Filename is too long." << std::endl;
-        inputFile.close();
         close(sockfd);
         return EXIT_FAILURE;
     }
@@ -100,7 +182,6 @@ int main(int argc, char* argv[]) {
 
     if (bytesSent < 0) {
         perror("send");
-        inputFile.close();
         close(sockfd);
         return EXIT_FAILURE;
     }
@@ -109,48 +190,36 @@ int main(int argc, char* argv[]) {
 
 
     // send file 
-    uint32_t sequence = 0;
+    uint32_t packetsPerThread = (totalPackets + NUM_THREADS - 1) / NUM_THREADS;
 
-    while (true)
-    {
-        Packet dataPacket{};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < NUM_THREADS; t++) {
+        uint32_t startSeq = static_cast<uint32_t>(t) * packetsPerThread;
+        if (startSeq >= totalPackets) break; 
+        
+    uint32_t endSeqExclusive = std::min(startSeq + packetsPerThread, totalPackets);
+    uint64_t startOffset = static_cast<uint64_t>(startSeq) * DATA_SIZE;
+    uint64_t endOffset = std::min(static_cast<uint64_t>(endSeqExclusive) * DATA_SIZE, fileSize);
 
-        dataPacket.type = PACKET_DATA; // #2
-        dataPacket.sequence = sequence;
+    threads.emplace_back(send_chunk, filename, args.ip_address, args.port, startOffset, endOffset, startSeq, t);
 
-        // Read up to DATA_SIZE bytes of the file to be transferred
-        inputFile.read( dataPacket.data, DATA_SIZE );
-        std::streamsize bytesRead = inputFile.gcount();
-
-        // No more data
-        if (bytesRead == 0) { break; }
-
-        dataPacket.data_length = static_cast<uint32_t>(bytesRead);
-
-        // Send packet
-        bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
-
-        if (bytesSent < 0) { 
-            perror("send");
-            break;
-        }
-
-       if (sequence %100 == 0) {
-            std::cout << "Sent packet "  << sequence << " ("  << bytesRead << " bytes)" << std::endl;
-        }
-        sequence++;
     }
 
+    for (auto& th : threads) {
+        th.join();
+    }
+    
+    std::cout << "All " << threads.size() << " sender threads finished (" << totalPackets << " packets total)." << std::endl;
 
     // end msg
     Packet endPacket{}; 
 
     endPacket.type = PACKET_END;
-    endPacket.sequence = sequence;
+    endPacket.sequence = totalPackets;
     endPacket.data_length = 0;
 
 
-    bytesSent = send( sockfd, &endPacket, sizeof(endPacket), 0);
+    bytesSent = send(sockfd, &endPacket, sizeof(endPacket), 0);
 
     if (bytesSent < 0) { 
         perror("send");
@@ -160,7 +229,6 @@ int main(int argc, char* argv[]) {
     }
 
     // cleanup
-    inputFile.close();
     close(sockfd);
 
 
