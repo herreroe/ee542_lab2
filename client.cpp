@@ -63,7 +63,7 @@ static bool send_chunk(const std::string& filename,
     uint32_t sequence = startSeq;
     uint64_t bytesRemaining = endOffset - startOffset;
 
-    constexpr double TOTAL_TARGET_BPS = 95.0 * 1000.0 * 1000.0;
+    constexpr double TOTAL_TARGET_BPS = 30.0 * 1000.0 * 1000.0;
     const double thread_target_bps = TOTAL_TARGET_BPS / static_cast<double>(NUM_THREADS);
     const double bits_per_packet = sizeof(Packet) * 8.0;
     
@@ -86,10 +86,12 @@ static bool send_chunk(const std::string& filename,
 
         dataPacket.data_length = static_cast<uint32_t>(bytesRead);
 
-        ssize_t bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
-        if (bytesSent < 0) {
-            perror("send (thread)");
-            break;
+        for(int i = 0; i < 5; i++) {
+            ssize_t bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
+            if (bytesSent < 0) {
+                perror("send (thread)");
+                break;
+            }
         }
 
         bytesRemaining -= static_cast<uint64_t>(bytesRead);

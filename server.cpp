@@ -50,6 +50,11 @@ int optval = 1;
     int bufsize = 16 * 1024 * 1024; // 16MB .. can increase/decrease this
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+
+    int actual_buf = 0;
+    socklen_t optlen = sizeof(actual_buf);
+    getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &actual_buf, &optlen);
+    std::cout << "Actual OS Receive Buffer Size: " << actual_buf << " bytes\n";
   
     struct sockaddr_in servaddr{};
     servaddr.sin_family = AF_INET;
