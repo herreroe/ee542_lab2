@@ -38,29 +38,10 @@ struct ReceiverState {
 };
 
 static bool send_nack_packets(
+    int sockfd,
     const std::vector<uint32_t>& missingPackets,
     const sockaddr_in& clientAddress)
 {
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        perror("socket creation failed (NACK)");
-        return false;
-    }
-
-    sockaddr_in serverAddress{};
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
-    serverAddress.sin_port = htons(SERVER_PORT);
-
-    if (bind(
-            sockfd,
-            reinterpret_cast<sockaddr*>(&serverAddress),
-            sizeof(serverAddress)) < 0) {
-        perror("bind failed (NACK)");
-        close(sockfd);
-        return false;
-    }
-
     constexpr size_t MAX_SEQS_PER_NACK =
         DATA_SIZE / sizeof(uint32_t);
 
@@ -93,7 +74,6 @@ static bool send_nack_packets(
 
         if (bytesSent < 0) {
             perror("sendto NACK");
-            close(sockfd);
             return false;
         }
 
@@ -102,7 +82,6 @@ static bool send_nack_packets(
                   << " missing packets." << std::endl;
     }
 
-    close(sockfd);
     return true;
 }
 
@@ -268,48 +247,255 @@ int main() {
         th.join();
     }
 
-    uint32_t totalPackets = state.finalTotalPackets.load();
-    std::vector<uint32_t> missingPackets;
-    for (uint32_t seq = 0; seq < totalPackets; ++seq) {
-        if (state.receivedSequences.find(seq) == state.receivedSequences.end()) {
-            missingPackets.push_back(seq);
-        }
+    uint32_t totalPackets =
+        state.finalTotalPackets.load();
+
+    std::cout << "Expected DATA packets: "
+              << totalPackets << std::endl;
+
+    if (state.outputFile == nullptr) {
+        std::cerr << "Output file is not available."
+                  << std::endl;
+        return EXIT_FAILURE;
     }
 
-    std::cout << "Expected DATA packets: " << totalPackets << std::endl;
-    std::cout << "Received DATA packets: " << state.receivedSequences.size() << std::endl;
-    std::cout << "Missing DATA packets: " << missingPackets.size() << std::endl;
+    sockaddr_in clientAddr{};
 
-        if (!missingPackets.empty()) {
-        std::cout << "Missing sequence numbers: ";
-        for (uint32_t seq : missingPackets) {
-            std::cout << seq << " ";
+    {
+        std::lock_guard<std::mutex> lock(state.clientMutex);
+
+        if (!state.clientAddressKnown) {
+            std::cerr
+                << "Cannot repair transfer: client address is unknown."
+                << std::endl;
+
+            fclose(state.outputFile);
+            return EXIT_FAILURE;
         }
-        std::cout << std::endl;
 
-        if (state.clientAddressKnown) {
-            sockaddr_in clientAddr;
+        clientAddr = state.clientAddress;
+    }
 
-            {
-                std::lock_guard<std::mutex> lock(state.clientMutex);
-                clientAddr = state.clientAddress;
+    // Create one socket for the repair phase.
+    // This socket sends NACKs and receives retransmitted DATA.
+    int repairSock = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (repairSock < 0) {
+        perror("socket creation failed (repair)");
+        fclose(state.outputFile);
+        return EXIT_FAILURE;
+    }
+
+    sockaddr_in repairAddress{};
+    repairAddress.sin_family = AF_INET;
+    repairAddress.sin_addr.s_addr = INADDR_ANY;
+    repairAddress.sin_port = htons(SERVER_PORT);
+
+    if (bind(
+            repairSock,
+            reinterpret_cast<sockaddr*>(&repairAddress),
+            sizeof(repairAddress)) < 0) {
+
+        perror("bind failed (repair)");
+        close(repairSock);
+        fclose(state.outputFile);
+        return EXIT_FAILURE;
+    }
+
+    // Larger buffer for retransmitted packets
+    int rcvbuf = 32 * 1024 * 1024;
+    setsockopt(
+        repairSock,
+        SOL_SOCKET,
+        SO_RCVBUF,
+        &rcvbuf,
+        sizeof(rcvbuf)
+    );
+
+    // After 500 ms without another repair packet,
+    // check the whole file again.
+    struct timeval timeout{};
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 500000;
+
+    setsockopt(
+        repairSock,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        &timeout,
+        sizeof(timeout)
+    );
+
+    while (true) {
+        std::vector<uint32_t> missingPackets;
+
+        // Check the entire sequence range again
+        for (uint32_t seq = 0; seq < totalPackets; ++seq) {
+            if (state.receivedSequences.find(seq) ==
+                state.receivedSequences.end()) {
+
+                missingPackets.push_back(seq);
+            }
+        }
+
+        std::cout << "Received DATA packets: "
+                  << state.receivedSequences.size()
+                  << std::endl;
+
+        std::cout << "Missing DATA packets: "
+                  << missingPackets.size()
+                  << std::endl;
+
+        // Everything has arrived
+        if (missingPackets.empty()) {
+            Packet completePacket{};
+            completePacket.type = PACKET_COMPLETE;
+            completePacket.data_length = 0;
+
+            ssize_t bytesSent = sendto(
+                repairSock,
+                &completePacket,
+                sizeof(completePacket),
+                0,
+                reinterpret_cast<const sockaddr*>(&clientAddr),
+                sizeof(clientAddr)
+            );
+
+            if (bytesSent < 0) {
+                perror("sendto COMPLETE");
+            }
+            else {
+                std::cout
+                    << "All packets received. COMPLETE sent."
+                    << std::endl;
             }
 
-            if (!send_nack_packets(missingPackets, clientAddr)) {
-                std::cerr << "Failed to send NACK packets." << std::endl;
-            }
+            break;
         }
-        else {
-            std::cerr << "Cannot send NACK: client address is unknown."
+
+        // Tell client which packets are still missing
+        if (!send_nack_packets(
+                repairSock,
+                missingPackets,
+                clientAddr)) {
+
+            std::cerr << "Failed to send NACK packets."
                       << std::endl;
+            break;
+        }
+
+        std::cout
+            << "Waiting for retransmitted packets..."
+            << std::endl;
+
+        // Receive only retransmitted DATA packets
+        while (true) {
+            Packet repairPacket{};
+
+            ssize_t n = recvfrom(
+                repairSock,
+                &repairPacket,
+                sizeof(repairPacket),
+                0,
+                nullptr,
+                nullptr
+            );
+
+            if (n < 0) {
+                if (errno == EWOULDBLOCK ||
+                    errno == EAGAIN) {
+
+                    std::cout
+                        << "Repair timeout. Rechecking missing packets..."
+                        << std::endl;
+
+                    break;
+                }
+
+                perror("recvfrom repair");
+                break;
+            }
+
+            if (repairPacket.type != PACKET_DATA) {
+                continue;
+            }
+
+            if (repairPacket.sequence >= totalPackets) {
+                std::cerr
+                    << "Invalid retransmitted sequence: "
+                    << repairPacket.sequence
+                    << std::endl;
+
+                continue;
+            }
+
+            if (repairPacket.data_length > DATA_SIZE) {
+                std::cerr
+                    << "Invalid retransmitted packet length."
+                    << std::endl;
+
+                continue;
+            }
+
+            // Already received this sequence
+            if (state.receivedSequences.find(
+                    repairPacket.sequence) !=
+                state.receivedSequences.end()) {
+
+                continue;
+            }
+
+            long offset =
+                static_cast<long>(repairPacket.sequence) *
+                static_cast<long>(DATA_SIZE);
+
+            if (fseek(
+                    state.outputFile,
+                    offset,
+                    SEEK_SET) != 0) {
+
+                perror("fseek repair");
+                continue;
+            }
+
+            size_t bytesWritten = fwrite(
+                repairPacket.data,
+                1,
+                repairPacket.data_length,
+                state.outputFile
+            );
+
+            if (bytesWritten !=
+                repairPacket.data_length) {
+
+                std::cerr
+                    << "Failed to write retransmitted packet "
+                    << repairPacket.sequence
+                    << std::endl;
+
+                continue;
+            }
+
+            state.receivedSequences.insert(
+                repairPacket.sequence
+            );
+
+            std::cout
+                << "Received retransmitted packet "
+                << repairPacket.sequence
+                << std::endl;
         }
     }
+
+    close(repairSock);
 
     if (state.outputFile != nullptr) {
+        fflush(state.outputFile);
         fclose(state.outputFile);
     }
 
-    std::cout << "File transfer complete." << std::endl;
+    std::cout << "File transfer complete."
+              << std::endl;
 
     return 0;
 }
