@@ -6,21 +6,64 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 
 #include <iostream>
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
 #include <chrono>
-#include <thread> 
+#include <thread>
+#include <vector>
+#include <atomic>
+#include <mutex>
+#include <unordered_set>
 
 #include "zap_protocol.hpp"
 #include "zap_cli.hpp"
-// TODO: 
-// notes: we should probs move the packet_start outside so that it must send an ack to confirm file can be sent. 
-// Then while loop for as long as it takes to recv all of the packets. then send an fin message - might be able to do away with the 
-// "PACKET_END" as in once all of the data from the file is sent and acked fully/
-// PACKET_START will likely need to specify how large the size of the file to be sent is - so the receiver can know how many packets to expect,etc
+
+// Utility to set CPU core affinity
+void pin_thread_to_core(int core_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    pthread_t current_thread = pthread_self();
+    if (pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) != 0) {
+        std::cerr << "Error setting thread affinity to core " << core_id << std::endl;
+    }
+}
+
+std::atomic<bool> transfer_complete(false);
+std::unordered_set<uint32_t> retransmit_queue;
+std::mutex retransmit_mutex;
+
+// Thread 2 (Core 1): ACK/NACK Receiver thread
+void ack_listener_thread(int sockfd, int core_id) {
+    pin_thread_to_core(core_id);
+    std::cout << "[Core " << core_id << "] ACK/NACK listener thread running." << std::endl;
+
+    Packet ackPacket{};
+    sockaddr_in fromAddr{};
+    socklen_t addrLen = sizeof(fromAddr);
+
+    while (!transfer_complete) {
+        ssize_t n = recvfrom(sockfd, &ackPacket, sizeof(ackPacket), 0,
+                             reinterpret_cast<sockaddr*>(&fromAddr), &addrLen);
+        if (n > 0) {
+            if (ackPacket.type == PACKET_NACK) {
+                // Add missing packet to retransmission queue
+                std::lock_guard<std::mutex> lock(retransmit_mutex);
+                retransmit_queue.insert(ackPacket.sequence);
+            } else if (ackPacket.type == PACKET_END) {
+                transfer_complete = true;
+            }
+        }
+    }
+}
 
 int main(int argc, char* argv[]) {
     Args args;
@@ -32,152 +75,181 @@ int main(int argc, char* argv[]) {
     const char* serverIP = args.ip_address.c_str();
     const char* filename = args.file_path.c_str();
     struct sockaddr_in servaddr;
-    std::ifstream inputFile(filename, std::ios::binary);
 
-    if (!inputFile.is_open()){
-        std::cerr<< "Could not open file: " << filename << std::endl;
+    // Fast Memory-Mapped File I/O setup
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        std::cerr << "Could not open file: " << filename << std::endl;
         return EXIT_FAILURE;
     }
 
-    std::cout << "Opened file: " << filename << std::endl;
+    struct stat st;
+    fstat(fd, &st);
+    size_t fileSize = st.st_size;
+
+    char* mapped_file = static_cast<char*>(mmap(NULL, fileSize, PROT_READ, MAP_SHARED, fd, 0));
+    if (mapped_file == MAP_FAILED) {
+        perror("mmap failed");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    madvise(mapped_file, fileSize, MADV_SEQUENTIAL | MADV_WILLNEED);
+
+    std::cout << "Opened and mapped file: " << filename << " (" << fileSize << " bytes)" << std::endl;
 
     // Create UDP socket
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("socket creation failed");
-        inputFile.close(); // close file here 
+        munmap(mapped_file, fileSize);
+        close(fd);
         exit(EXIT_FAILURE);
     }
 
-    int bufsize = 16 * 1024 * 1024; // 16MB .. can increase/decrease this
+    int bufsize = 32 * 1024 * 1024; // 32MB socket buffer
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 
-    std::cout << "UDP socket created."  << std::endl;
+    std::cout << "UDP socket created." << std::endl;
 
     memset(&servaddr, 0, sizeof(servaddr));
 
     // Fill server address info
-    servaddr.sin_family = AF_INET;              // IPv4
-    servaddr.sin_port   = htons(args.port);          // Server port
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(args.port);
 
     if (inet_pton(AF_INET, serverIP, &servaddr.sin_addr) <= 0) {
         std::cerr << "Invalid server IP address: " << serverIP << std::endl;
-        inputFile.close();
+        munmap(mapped_file, fileSize);
+        close(fd);
         close(sockfd);
-
         return EXIT_FAILURE;
     }
 
-    // connect UDP socket tyo server
     if (connect(sockfd, reinterpret_cast<sockaddr*>(&servaddr), sizeof(servaddr)) < 0) {
         perror("connect");
-        inputFile.close();
+        munmap(mapped_file, fileSize);
+        close(fd);
         close(sockfd);
         return EXIT_FAILURE;
     }
 
     std::cout << "UDP socket connected to " << serverIP << ":" << args.port << std::endl;
 
-    Packet packet{};
-    packet.type = PACKET_START;
-    packet.sequence = 0;
+    // Pin main transmission thread to Core 0
+    pin_thread_to_core(0);
 
+    uint32_t total_packets = (fileSize + DATA_SIZE - 1) / DATA_SIZE;
+
+    // Send START packet with filesize metadata
+    Packet startPacket{};
+    startPacket.type = PACKET_START;
+    startPacket.sequence = total_packets;
     std::string savePath = args.save_dir.empty() ? args.file_path : args.save_dir;
-    packet.data_length = savePath.size();
+    startPacket.data_length = savePath.size();
+    memcpy(startPacket.data, savePath.c_str(), startPacket.data_length);
 
-    if (packet.data_length == 0 || packet.data_length >= FILENAME_SIZE) {// check filename 
-        std::cerr << "Filename is too long." << std::endl;
-        inputFile.close();
-        close(sockfd);
-        return EXIT_FAILURE;
-    }
+    send(sockfd, &startPacket, sizeof(startPacket), 0);
+    std::cout << "START packet sent. Total packets expected: " << total_packets << std::endl;
 
-    // copy to data
-    memcpy( packet.data,  savePath.c_str(), packet.data_length );
-    // send data
-    ssize_t bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
+    // Spawn ACK/NACK Receiver on Core 1
+    std::thread ack_thread(ack_listener_thread, sockfd, 1);
 
-    if (bytesSent < 0) {
-        perror("send");
-        inputFile.close();
-        close(sockfd);
-        return EXIT_FAILURE;
-    }
-
-    std::cout << "START packet sent." << std::endl;
-
-    constexpr double TARGET_BPS = 30.0 * 1000.0 * 1000.0;
+    constexpr double TARGET_BPS = 95.0 * 1000.0 * 1000.0; // Paced near 95 Mbps line rate
     constexpr double BITS_PER_PACKET = sizeof(Packet) * 8.0;
     const auto packet_interval = std::chrono::nanoseconds(
         static_cast<long long>((BITS_PER_PACKET / TARGET_BPS) * 1e9)
     );
 
-    uint32_t sequence = 0;
     auto next_send_time = std::chrono::high_resolution_clock::now();
 
-    // Send file payload
-    while (true)
-    {
+    // Primary Transmission Loop (Core 0)
+    for (uint32_t seq = 0; seq < total_packets; ++seq) {
+        // Priority check for retransmissions
+        {
+            std::lock_guard<std::mutex> lock(retransmit_mutex);
+            if (!retransmit_queue.empty()) {
+                auto it = retransmit_queue.begin();
+                uint32_t r_seq = *it;
+                retransmit_queue.erase(it);
+
+                Packet rPacket{};
+                rPacket.type = PACKET_DATA;
+                rPacket.sequence = r_seq;
+                size_t offset = (size_t)r_seq * DATA_SIZE;
+                size_t bytesToRead = std::min((size_t)DATA_SIZE, fileSize - offset);
+                rPacket.data_length = bytesToRead;
+                memcpy(rPacket.data, mapped_file + offset, bytesToRead);
+
+                send(sockfd, &rPacket, sizeof(rPacket), 0);
+            }
+        }
+
         Packet dataPacket{};
+        dataPacket.type = PACKET_DATA;
+        dataPacket.sequence = seq;
 
-        dataPacket.type = PACKET_DATA; // #2
-        dataPacket.sequence = sequence;
+        size_t offset = (size_t)seq * DATA_SIZE;
+        size_t bytesToRead = std::min((size_t)DATA_SIZE, fileSize - offset);
+        dataPacket.data_length = static_cast<uint32_t>(bytesToRead);
+        memcpy(dataPacket.data, mapped_file + offset, bytesToRead);
 
-        // Read up to DATA_SIZE bytes of the file to be transferred
-        inputFile.read( dataPacket.data, DATA_SIZE );
-        std::streamsize bytesRead = inputFile.gcount();
+        send(sockfd, &dataPacket, sizeof(dataPacket), 0);
 
-        // No more data
-        if (bytesRead == 0) { break; }
-
-        dataPacket.data_length = static_cast<uint32_t>(bytesRead);
-
-        // Send packet
-        bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
-
-        if (bytesSent < 0) { 
-            perror("send");
-            break;
+        if (seq % 10000 == 0) {
+            std::cout << "[Core 0] Sent packet " << seq << "/" << total_packets << std::endl;
         }
 
-       if (sequence %100 == 0) {
-            std::cout << "Sent packet "  << sequence << " ("  << bytesRead << " bytes)" << std::endl;
-        }
-        sequence++;
-
-        // Pace transmission to prevent buffer overflow
         next_send_time += packet_interval;
         while (std::chrono::high_resolution_clock::now() < next_send_time) {
             #if defined(__x86_64__) || defined(_M_X64)
-            __builtin_ia32_pause(); // Saves CPU execution pipeline stalls during spin-wait
+            __builtin_ia32_pause();
             #endif
         }
     }
 
-    // end msg
-    Packet endPacket{};
+    // Retransmission Sweep Loop (Core 0) until Server sends completion ACK
+    while (!transfer_complete) {
+        uint32_t r_seq = 0;
+        bool has_retransmit = false;
+        {
+            std::lock_guard<std::mutex> lock(retransmit_mutex);
+            if (!retransmit_queue.empty()) {
+                auto it = retransmit_queue.begin();
+                r_seq = *it;
+                retransmit_queue.erase(it);
+                has_retransmit = true;
+            }
+        }
 
-    endPacket.type = PACKET_END;
-    endPacket.sequence = sequence;
-    endPacket.data_length = 0;
+        if (has_retransmit) {
+            Packet rPacket{};
+            rPacket.type = PACKET_DATA;
+            rPacket.sequence = r_seq;
+            size_t offset = (size_t)r_seq * DATA_SIZE;
+            size_t bytesToRead = std::min((size_t)DATA_SIZE, fileSize - offset);
+            rPacket.data_length = bytesToRead;
+            memcpy(rPacket.data, mapped_file + offset, bytesToRead);
 
-
-    bytesSent = send( sockfd, &endPacket, sizeof(endPacket), 0);
-
-    if (bytesSent < 0) { 
-        perror("send");
+            send(sockfd, &rPacket, sizeof(rPacket), 0);
+        } else {
+            // Re-notify END to elicit final confirmation
+            Packet endPacket{};
+            endPacket.type = PACKET_END;
+            send(sockfd, &endPacket, sizeof(endPacket), 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
     }
-    else {
-        std::cout << "END packet sent." << std::endl;
+
+    if (ack_thread.joinable()) {
+        ack_thread.join();
     }
 
-    // cleanup
-    inputFile.close();
+    // Cleanup fast memory maps
+    munmap(mapped_file, fileSize);
+    close(fd);
     close(sockfd);
 
-
     std::cout << "File transfer complete." << std::endl;
-
     return 0;
 }
