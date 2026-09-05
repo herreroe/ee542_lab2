@@ -48,7 +48,7 @@ int optval = 1;
     }
 
     // added bc no flow control or ACKs yet
-    int rcvbuf = 32 * 1024 * 1024;
+    int rcvbuf = 64 * 1024 * 1024;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
   
     struct sockaddr_in servaddr{};
@@ -212,6 +212,8 @@ int main() {
     if (state.outputFile != nullptr) {
         fclose(state.outputFile);
     }
+
+    std::cout << "Dropped packets: " << missingPackets.size() << " / " << totalPackets << std::endl;
 
     std::cout << "File transfer complete." << std::endl;
 
