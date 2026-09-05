@@ -62,8 +62,7 @@ static bool send_chunk(const std::string& filename,
 
     uint32_t sequence = startSeq;
     uint64_t bytesRemaining = endOffset - startOffset;
-
-    constexpr double TOTAL_TARGET_BPS = 30.0 * 1000.0 * 1000.0;
+    constexpr double TOTAL_TARGET_BPS = 60.0 * 1000.0 * 1000.0;
     const double thread_target_bps = TOTAL_TARGET_BPS / static_cast<double>(NUM_THREADS);
     const double bits_per_packet = sizeof(Packet) * 8.0;
     
@@ -154,7 +153,7 @@ int main(int argc, char* argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    int bufsize = 16 * 1024 * 1024; // 16MB .. can increase/decrease this
+    int bufsize = 32 * 1024 * 1024; // 32MB .. can increase/decrease this
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 

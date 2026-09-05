@@ -8,7 +8,7 @@
 #include <sys/types.h> 
 #include <sys/socket.h> 
 #include <arpa/inet.h> 
-#include <netinet/in.h> 
+#include <netinet/in.h>
   
 #include <iostream>
 #include <fstream>
@@ -49,7 +49,7 @@ int optval = 1;
         return;
     }
 
-    int bufsize = 16 * 1024 * 1024; // 16MB .. can increase/decrease this
+    int bufsize = 32 * 1024 * 1024; // 32MB .. can increase/decrease this
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 
