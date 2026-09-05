@@ -47,6 +47,20 @@ static bool send_nack_packets(
         return false;
     }
 
+    sockaddr_in serverAddress{};
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_addr.s_addr = INADDR_ANY;
+    serverAddress.sin_port = htons(SERVER_PORT);
+
+    if (bind(
+            sockfd,
+            reinterpret_cast<sockaddr*>(&serverAddress),
+            sizeof(serverAddress)) < 0) {
+        perror("bind failed (NACK)");
+        close(sockfd);
+        return false;
+    }
+
     constexpr size_t MAX_SEQS_PER_NACK =
         DATA_SIZE / sizeof(uint32_t);
 
