@@ -101,6 +101,67 @@ static bool send_chunk(const std::string& filename,
 // "PACKET_END" as in once all of the data from the file is sent and acked fully/
 // PACKET_START will likely need to specify how large the size of the file to be sent is - so the receiver can know how many packets to expect,etc
 
+static bool resend_packet(
+    int sockfd,
+    const std::string& filePath,
+    uint32_t sequence,
+    uint64_t fileSize)
+{
+    std::ifstream file(filePath, std::ios::binary);
+
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file for retransmission." << std::endl;
+        return false;
+    }
+
+    uint64_t offset =
+        static_cast<uint64_t>(sequence) * DATA_SIZE;
+
+    if (offset >= fileSize) {
+        std::cerr << "Invalid retransmission sequence: "
+                  << sequence << std::endl;
+        return false;
+    }
+
+    file.seekg(offset);
+
+    uint64_t remaining = fileSize - offset;
+    uint32_t bytesToRead =
+        static_cast<uint32_t>(
+            std::min<uint64_t>(DATA_SIZE, remaining)
+        );
+
+    Packet packet{};
+    packet.type = PACKET_DATA;
+    packet.sequence = sequence;
+    packet.data_length = bytesToRead;
+
+    file.read(packet.data, bytesToRead);
+
+    if (!file) {
+        std::cerr << "Failed to read packet "
+                  << sequence << std::endl;
+        return false;
+    }
+
+    ssize_t bytesSent = send(
+        sockfd,
+        &packet,
+        sizeof(packet),
+        0
+    );
+
+    if (bytesSent < 0) {
+        perror("send retransmission");
+        return false;
+    }
+
+    std::cout << "Retransmitted packet "
+              << sequence << std::endl;
+
+    return true;
+}
+
 int main(int argc, char* argv[]) {
     Args args;
     if (!parse_args(argc, argv, &args)) {
@@ -227,10 +288,66 @@ int main(int argc, char* argv[]) {
     else{
         std::cout << "END packet sent." << std::endl;
     }
+    std::cout << "Waiting for NACK or COMPLETE..." << std::endl;
 
-    // cleanup
+    while (true) {
+        Packet response{};
+
+        ssize_t n = recv(
+            sockfd,
+            &response,
+            sizeof(response),
+            0
+        );
+
+        if (n < 0) {
+            perror("recv control packet");
+            break;
+        }
+
+        if (response.type == PACKET_NACK) {
+            if (response.data_length > DATA_SIZE ||
+                response.data_length % sizeof(uint32_t) != 0) {
+                std::cerr << "Invalid NACK packet." << std::endl;
+                continue;
+            }
+
+            size_t count =
+                response.data_length / sizeof(uint32_t);
+
+            std::vector<uint32_t> missingSequences(count);
+
+            memcpy(
+                missingSequences.data(),
+                response.data,
+                response.data_length
+            );
+
+            std::cout << "Received NACK for "
+                      << count
+                      << " packets." << std::endl;
+
+            for (uint32_t seq : missingSequences) {
+                resend_packet(
+                    sockfd,
+                    args.file_path,
+                    seq,
+                    fileSize
+                );
+            }
+        }
+        else if (response.type == PACKET_COMPLETE) {
+            std::cout << "Server confirmed file transfer complete."
+                      << std::endl;
+            break;
+        }
+        else {
+            std::cerr << "Unexpected control packet type: "
+                      << response.type << std::endl;
+        }
+    }
+
     close(sockfd);
-
 
     std::cout << "File transfer complete." << std::endl;
 
