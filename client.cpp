@@ -76,7 +76,7 @@ static bool send_chunk(const std::string& filename,
 
         bool sendFailed = false;
 
-        for (int copy = 0; copy < 5; ++copy) {
+        for (int copy = 0; copy < 2; ++copy) {
             ssize_t bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
             if (bytesSent < 0) {
                 perror("send (thread)");
@@ -287,14 +287,18 @@ int main(int argc, char* argv[]) {
     endPacket.sequence = totalPackets;
     endPacket.data_length = 0;
 
-
-    bytesSent = send(sockfd, &endPacket, sizeof(endPacket), 0);
-
-    if (bytesSent < 0) { 
-        perror("send");
+    bool endSendFailed = false;
+    for (int i = 0; i < 5; ++i) {
+        bytesSent = send(sockfd, &endPacket, sizeof(endPacket), 0);
+        if (bytesSent < 0) {
+            perror("send END");
+            endSendFailed = true;
+            break;
+        }
     }
-    else{
-        std::cout << "END packet sent." << std::endl;
+    
+    if (!endSendFailed) {
+        std::cout << "END packet sent 5 times." << std::endl;
     }
     std::cout << "Waiting for NACK or COMPLETE..." << std::endl;
 
