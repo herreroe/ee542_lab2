@@ -4,6 +4,7 @@
 #include <bits/stdc++.h> 
 #include <stdlib.h> 
 #include <unistd.h> 
+#include <fcntl.h> 
 #include <string.h> 
 #include <sys/types.h> 
 #include <sys/socket.h> 
@@ -26,9 +27,9 @@
 
 struct ReceiverState {
     std::mutex fileMutex;
-    FILE* outputFile = nullptr;
-    bool receivingFile = false;
-    std::unordered_set<uint32_t> receivedSequences;
+    int outputFd = -1;
+    std::atomic<bool> receivingFile{false};
+    std::vector<std::atomic<uint8_t>> receivedSequences;
 
     std::atomic<bool> stopRequested{false};
     std::atomic<uint32_t> finalTotalPackets{0};
@@ -106,17 +107,27 @@ int optval = 1;
         // Start msg
         if (packet.type == PACKET_START) {
             std::lock_guard<std::mutex> lock(state.fileMutex);
-            if (state.outputFile == nullptr) {
+            if (state.outputFd == -1) {
                 std::cout << "[thread " << threadIndex << "] Received START packet." << std::endl;
-                state.receivedSequences.clear();
-                std::string filename(packet.data, packet.data_length);
+                uint64_t fileSize = 0;
+                memcpy(&fileSize, packet.data, sizeof(fileSize));
+                std::string filename(packet.data + sizeof(fileSize), packet.data_length);
 
-                state.outputFile = fopen(filename.c_str(), "wb");
-                if (state.outputFile == nullptr) {
+                state.outputFd = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (state.outputFd < 0) {
                     perror("Failed to open output file");
-                    state.receivingFile = false;
+                    state.receivingFile.store(false);
+                } else if (ftruncate(state.outputFd, static_cast<off_t>(fileSize)) != 0) {
+                    perror("Failed to truncate output file");
+                    close(state.outputFd);
+                    state.outputFd = -1;
+                    state.receivingFile.store(false);
                 } else {
-                    state.receivingFile = true;
+                    state.receivedSequences = std::vector<std::atomic<uint8_t>>(packet.sequence);
+                    for (auto& received : state.receivedSequences) {
+                        received.store(0, std::memory_order_relaxed);
+                    }
+                    state.receivingFile.store(true, std::memory_order_release);
                     std::cout << "[thread " << threadIndex << "] Opened "
                               << filename << " for writing." << std::endl;
                 }
@@ -126,37 +137,28 @@ int optval = 1;
         
         // paylaod msg 
         else if (packet.type == PACKET_DATA) {
-            std::lock_guard<std::mutex> lock(state.fileMutex);
-            
-            if (!state.receivingFile) {
+            if (!state.receivingFile.load(std::memory_order_acquire)) {
                 std::cerr << "[thread " << threadIndex << "] Received DATA before START." << std::endl;
                 continue;
             }
 
             // duplicate packet check
             // if sequence number is already in the set, drop this copy and keep original
-            if (state.receivedSequences.find(packet.sequence) != state.receivedSequences.end()) {
+            if (packet.sequence >= state.receivedSequences.size() ||
+                state.receivedSequences[packet.sequence].exchange(1, std::memory_order_relaxed) != 0) {
                 continue;
             }
 
             // order by sequence number
             // seek where the chunk belongs in the file before writing it
-            long offset = static_cast<long>(packet.sequence) * static_cast<long>(DATA_SIZE);
-            if (fseek(state.outputFile, offset, SEEK_SET) != 0) {
-                perror("fseek");
+            off_t offset = static_cast<off_t>(packet.sequence) * static_cast<off_t>(DATA_SIZE);
+
+            ssize_t bytesWritten = pwrite(state.outputFd, packet.data, packet.data_length, offset);
+            if (bytesWritten != static_cast<ssize_t>(packet.data_length)) {
+                std::cerr << "[thread " << threadIndex << "] Failed to write all data" << std::endl;
+                state.receivedSequences[packet.sequence].store(0, std::memory_order_relaxed);
                 continue;
             }
-
-            size_t bytesWritten = fwrite(packet.data, 1, packet.data_length, state.outputFile);
-            if (bytesWritten != packet.data_length) {
-                std::cerr << "[thread " << threadIndex << "] Failed to write all data" << std::endl;
-                fclose(state.outputFile);
-                state.outputFile = nullptr;
-                state.receivingFile = false;
-                break;
-            }
-
-            state.receivedSequences.insert(packet.sequence);
 
             if (packet.sequence %100 == 0) {
                 std::cout << "[thread " << threadIndex << "] Received packet " << packet.sequence << " (" << packet.data_length  << " bytes)" << std::endl;
@@ -197,15 +199,19 @@ int main() {
     }
 
     uint32_t totalPackets = state.finalTotalPackets.load();
+    uint32_t receivedPackets = 0;
     std::vector<uint32_t> missingPackets;
     for (uint32_t seq = 0; seq < totalPackets; ++seq) {
-        if (state.receivedSequences.find(seq) == state.receivedSequences.end()) {
+        if (seq >= state.receivedSequences.size() ||
+            state.receivedSequences[seq].load(std::memory_order_relaxed) == 0) {
             missingPackets.push_back(seq);
+        } else {
+            receivedPackets++;
         }
     }
 
     std::cout << "Expected DATA packets: " << totalPackets << std::endl;
-    std::cout << "Received DATA packets: " << state.receivedSequences.size() << std::endl;
+    std::cout << "Received DATA packets: " << receivedPackets << std::endl;
     std::cout << "Missing DATA packets: " << missingPackets.size() << std::endl;
 
     if (!missingPackets.empty()) {
@@ -216,8 +222,8 @@ int main() {
         std::cout << std::endl;
     }
 
-    if (state.outputFile != nullptr) {
-        fclose(state.outputFile);
+    if (state.outputFd >= 0) {
+        close(state.outputFd);
     }
 
     std::cout << "File transfer complete." << std::endl;

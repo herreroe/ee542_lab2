@@ -184,7 +184,7 @@ int main(int argc, char* argv[]) {
     Packet packet{};
 
     packet.type = PACKET_START;
-    packet.sequence = 0;
+    packet.sequence = totalPackets;
 
     std::string savePath = args.save_dir.empty() ? args.file_path : args.save_dir;
     packet.data_length = savePath.size();
@@ -196,7 +196,8 @@ int main(int argc, char* argv[]) {
     }
 
     // copy to data
-    memcpy( packet.data,  savePath.c_str(), packet.data_length );
+    memcpy( packet.data, &fileSize, sizeof(fileSize) );
+    memcpy( packet.data + sizeof(fileSize),  savePath.c_str(), packet.data_length );
 
     auto firstBitSentTime = std::chrono::high_resolution_clock::now();
 
