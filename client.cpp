@@ -74,9 +74,17 @@ static bool send_chunk(const std::string& filename,
 
         dataPacket.data_length = static_cast<uint32_t>(bytesRead);
 
-        ssize_t bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
-        if (bytesSent < 0) {
-            perror("send (thread)");
+        bool sendFailed = false;
+
+        for (int copy = 0; copy < 5; ++copy) {
+            ssize_t bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
+            if (bytesSent < 0) {
+                perror("send (thread)");
+                sendFailed = true;
+                break;
+            }
+        }
+        if (sendFailed) {
             break;
         }
 
