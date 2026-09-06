@@ -1,5 +1,4 @@
 // Client side implementation of UDP client-server model - side that will be "sending" the file.
-// https://www.geeksforgeeks.org/cpp/udp-server-client-implementation-c/
 #include <bits/stdc++.h>
 #include <unistd.h>
 #include <string.h>
@@ -95,11 +94,6 @@ static bool send_chunk(const std::string& filename,
     return true;
 }
 
-// TODO: 
-// notes: we should probs move the packet_start outside so that it must send an ack to confirm file can be sent. 
-// Then while loop for as long as it takes to recv all of the packets. then send an fin message - might be able to do away with the 
-// "PACKET_END" as in once all of the data from the file is sent and acked fully/
-// PACKET_START will likely need to specify how large the size of the file to be sent is - so the receiver can know how many packets to expect,etc
 
 static bool resend_packet(
     int sockfd,
@@ -171,8 +165,8 @@ int main(int argc, char* argv[]) {
 
      // figure out the file size so we can split it into chunks
     inputFile.seekg(0, std::ios::end);
-    uint64_t fileSize = static_cast<uint64_t>(inputFile.tellg());
-    inputFile.seekg(0, std::ios::beg);
+    uint64_t fileSize = static_cast<uint64_t>(inputFile.tellg()); // tellg gets end of file from seekg
+    inputFile.seekg(0, std::ios::beg); // set back tobeginning
     uint32_t totalPackets = static_cast<uint32_t>((fileSize + DATA_SIZE - 1) / DATA_SIZE);
 
     // Create UDP socket
@@ -188,16 +182,12 @@ int main(int argc, char* argv[]) {
 
     // Fill server address info
     servaddr.sin_family = AF_INET;              // IPv4
-    servaddr.sin_port   = htons(args.port);          // Server port
+    servaddr.sin_port   = htons(args.port);     // Server port
 
     // checkk server addr
     if (inet_pton(AF_INET, serverIP,  &servaddr.sin_addr ) <= 0) {
-        std::cerr
-            << "Invalid server IP address: "
-            << serverIP
-            << std::endl;
+        std::cerr << "Invalid server IP address: " << serverIP << std::endl;
         close(sockfd);
-
         return EXIT_FAILURE;
     }
 
@@ -211,7 +201,6 @@ int main(int argc, char* argv[]) {
     std::cout << "UDP socket connected to " << serverIP << ":" << args.port << std::endl;
 
     Packet packet{};
-
     packet.type = PACKET_START;
     packet.sequence = 0;
 
@@ -224,17 +213,16 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    // copy to data
     memcpy( packet.data,  savePath.c_str(), packet.data_length );
-    // send data
-    auto firstBitSentTime = std::chrono::high_resolution_clock::now();
+
+    auto firstBitSentTime = std::chrono::high_resolution_clock::now(); // record when first bit is sent -- should this be changes to when the first bit of payload is sent?
     ssize_t bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
     if (bytesSent < 0) {
         perror("send");
         close(sockfd);
         return EXIT_FAILURE;
     }
-    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(firstBitSentTime.time_since_epoch()).count();
+    auto duration_us = std::chrono::duration_cast<std::chrono::seconds>(firstBitSentTime.time_since_epoch()).count(); // keep as micro seconds b/c higher precision compared to sec
 
     std::cout << "START packet sent." << std::endl;
 
@@ -247,12 +235,11 @@ int main(int argc, char* argv[]) {
         uint32_t startSeq = static_cast<uint32_t>(t) * packetsPerThread;
         if (startSeq >= totalPackets) break; 
         
-    uint32_t endSeqExclusive = std::min(startSeq + packetsPerThread, totalPackets);
-    uint64_t startOffset = static_cast<uint64_t>(startSeq) * DATA_SIZE;
-    uint64_t endOffset = std::min(static_cast<uint64_t>(endSeqExclusive) * DATA_SIZE, fileSize);
+        uint32_t endSeqExclusive = std::min(startSeq + packetsPerThread, totalPackets);
+        uint64_t startOffset = static_cast<uint64_t>(startSeq) * DATA_SIZE;
+        uint64_t endOffset = std::min(static_cast<uint64_t>(endSeqExclusive) * DATA_SIZE, fileSize);
 
-    threads.emplace_back(send_chunk, filename, args.ip_address, args.port, startOffset, endOffset, startSeq, t);
-
+        threads.emplace_back(send_chunk, filename, args.ip_address, args.port, startOffset, endOffset, startSeq, t);
     }
 
     for (auto& th : threads) {
@@ -263,7 +250,6 @@ int main(int argc, char* argv[]) {
 
     // end msg
     Packet endPacket{}; 
-
     endPacket.type = PACKET_END;
     endPacket.sequence = totalPackets;
     endPacket.data_length = 0;
@@ -279,13 +265,12 @@ int main(int argc, char* argv[]) {
     }
     
     if (!endSendFailed) {
-        std::cout << "END packet sent 5 times." << std::endl;
+        std::cout << "END packet sent." << std::endl;
     }
     std::cout << "Waiting for NACK or COMPLETE..." << std::endl;
 
     while (true) {
         Packet response{};
-
         ssize_t n = recv( sockfd, &response, sizeof(response), 0);
 
         if (n < 0) {
@@ -294,7 +279,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (response.type == PACKET_NACK) {
-            if (response.data_length > DATA_SIZE || response.data_length % sizeof(uint32_t) != 0) {
+            if (response.data_length > DATA_SIZE || response.data_length % sizeof(uint32_t) != 0) { //corrupted
                 std::cerr << "Invalid NACK packet." << std::endl;
                 continue;
             }
@@ -303,7 +288,7 @@ int main(int argc, char* argv[]) {
 
             std::vector<uint32_t> missingSequences(count);
 
-            memcpy(missingSequences.data(), response.data, response.data_length);
+            memcpy(missingSequences.data(), response.data, response.data_length); // copy missing seq nums into vector
 
             std::cout << "Received NACK for " << count << " packets." << std::endl;
 

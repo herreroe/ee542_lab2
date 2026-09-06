@@ -1,5 +1,4 @@
 // Server side implementation of UDP client-server model - side that will be "receiving" the file
-// https://www.geeksforgeeks.org/cpp/udp-server-client-implementation-c/
 
 #include <bits/stdc++.h> 
 #include <stdlib.h> 
@@ -37,13 +36,8 @@ struct ReceiverState {
     std::atomic<uint32_t> finalTotalPackets{0};
 };
 
-static bool send_nack_packets(
-    int sockfd,
-    const std::vector<uint32_t>& missingPackets,
-    const sockaddr_in& clientAddress)
-{
-    constexpr size_t MAX_SEQS_PER_NACK =
-        DATA_SIZE / sizeof(uint32_t);
+static bool send_nack_packets(int sockfd, const std::vector<uint32_t>& missingPackets, const sockaddr_in& clientAddress) {
+    constexpr size_t MAX_SEQS_PER_NACK = DATA_SIZE / sizeof(uint32_t); // might need to edit for the MTU stuff
 
     for (size_t i = 0; i < missingPackets.size(); i += MAX_SEQS_PER_NACK) {
         Packet nackPacket{};
@@ -51,7 +45,7 @@ static bool send_nack_packets(
 
         size_t count = std::min(MAX_SEQS_PER_NACK, missingPackets.size() - i);
 
-        memcpy( nackPacket.data, missingPackets.data() + i, count * sizeof(uint32_t));
+        memcpy(nackPacket.data, missingPackets.data() + i, count * sizeof(uint32_t));
 
         nackPacket.data_length = static_cast<uint32_t>(count * sizeof(uint32_t));
 
@@ -81,14 +75,13 @@ static void receiver_thread(ReceiverState& state, int threadIndex) {
         return;
     }
 
-int optval = 1;
+    int optval = 1;
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0) {
         perror("setsockopt(SO_REUSEPORT) failed");
         close(sockfd);
         return;
     }
 
-    // added bc no flow control or ACKs yet
     int rcvbuf = 32 * 1024 * 1024;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
   
@@ -103,6 +96,7 @@ int optval = 1;
         return;
     }
 
+    // add in timeout.
     struct timeval timeout{};
     timeout.tv_sec = 0;
     timeout.tv_usec = 200000; // 200ms
@@ -124,11 +118,11 @@ int optval = 1;
             &clientAddressLength
         );
 
-
+        // handles timeouts/errors
         if (n < 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
                 if (state.stopRequested.load()) {
-                    if(++consecutiveTimeoutsAfterStop >= 2) break;
+                    if(++consecutiveTimeoutsAfterStop >= 2) break; 
                 }
                 continue;
             }
@@ -191,7 +185,7 @@ int optval = 1;
 
             state.receivedSequences.insert(packet.sequence);
 
-            if (packet.sequence %1000 == 0) { // occasional
+            if (packet.sequence %1000 == 0) { // occasional print
                 std::cout << "[thread " << threadIndex << "] Received packets " << packet.sequence << " (" << packet.data_length  << " bytes)" << std::endl;
             }
         }
@@ -214,7 +208,6 @@ int optval = 1;
 
     close(sockfd);
     std::cout << "[thread " << threadIndex << "] Closing connection." << std::endl;
-
 }
 
 int main() {
@@ -244,16 +237,11 @@ int main() {
 
     {
         std::lock_guard<std::mutex> lock(state.clientMutex);
-
         if (!state.clientAddressKnown) {
-            std::cerr
-                << "Cannot repair transfer: client address is unknown."
-                << std::endl;
-
+            std::cerr << "Cannot repair transfer: client address is unknown." << std::endl;
             fclose(state.outputFile);
             return EXIT_FAILURE;
         }
-
         clientAddr = state.clientAddress;
     }
 
@@ -272,7 +260,7 @@ int main() {
     repairAddress.sin_addr.s_addr = INADDR_ANY;
     repairAddress.sin_port = htons(SERVER_PORT);
 
-    if (bind( repairSock, reinterpret_cast<sockaddr*>(&repairAddress), sizeof(repairAddress)) < 0) {
+    if (bind(repairSock, reinterpret_cast<sockaddr*>(&repairAddress), sizeof(repairAddress)) < 0) {
         perror("bind failed (repair)");
         close(repairSock);
         fclose(state.outputFile);
