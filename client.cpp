@@ -16,9 +16,11 @@
 #include <vector>
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 
 #include "zap_protocol.hpp"
 #include "zap_cli.hpp"
+
 
 static std::mutex g_coutMutex;
 
@@ -74,17 +76,9 @@ static bool send_chunk(const std::string& filename,
 
         dataPacket.data_length = static_cast<uint32_t>(bytesRead);
 
-        bool sendFailed = false;
-
-        for (int copy = 0; copy < 2; ++copy) {
-            ssize_t bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
-            if (bytesSent < 0) {
-                perror("send (thread)");
-                sendFailed = true;
-                break;
-            }
-        }
-        if (sendFailed) {
+        ssize_t bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
+        if (bytesSent < 0) {
+            perror("send (thread)");
             break;
         }
 
@@ -94,8 +88,6 @@ static bool send_chunk(const std::string& filename,
 
     {
         std::lock_guard<std::mutex> lock(g_coutMutex);
-        std::cout << "Thread " << threadIndex << " sent packets ["
-                  << startSeq << ", " << sequence << ")" << std::endl;
     }
 
     file.close();
@@ -126,18 +118,14 @@ static bool resend_packet(
         static_cast<uint64_t>(sequence) * DATA_SIZE;
 
     if (offset >= fileSize) {
-        std::cerr << "Invalid retransmission sequence: "
-                  << sequence << std::endl;
+        std::cerr << "Invalid retransmission sequence: " << sequence << std::endl;
         return false;
     }
 
     file.seekg(offset);
 
     uint64_t remaining = fileSize - offset;
-    uint32_t bytesToRead =
-        static_cast<uint32_t>(
-            std::min<uint64_t>(DATA_SIZE, remaining)
-        );
+    uint32_t bytesToRead = static_cast<uint32_t>( std::min<uint64_t>(DATA_SIZE, remaining));
 
     Packet packet{};
     packet.type = PACKET_DATA;
@@ -147,30 +135,22 @@ static bool resend_packet(
     file.read(packet.data, bytesToRead);
 
     if (!file) {
-        std::cerr << "Failed to read packet "
-                  << sequence << std::endl;
+        std::cerr << "Failed to read packet " << sequence << std::endl;
         return false;
     }
 
-    ssize_t bytesSent = send(
-        sockfd,
-        &packet,
-        sizeof(packet),
-        0
-    );
+    ssize_t bytesSent = send(sockfd, &packet, sizeof(packet), 0);
 
     if (bytesSent < 0) {
         perror("send retransmission");
         return false;
     }
 
-    std::cout << "Retransmitted packet "
-              << sequence << std::endl;
-
     return true;
 }
 
 int main(int argc, char* argv[]) {
+    int retransmitCount = 0;
     Args args;
     if (!parse_args(argc, argv, &args)) {
         return EXIT_FAILURE;
@@ -247,13 +227,14 @@ int main(int argc, char* argv[]) {
     // copy to data
     memcpy( packet.data,  savePath.c_str(), packet.data_length );
     // send data
+    auto firstBitSentTime = std::chrono::high_resolution_clock::now();
     ssize_t bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
-
     if (bytesSent < 0) {
         perror("send");
         close(sockfd);
         return EXIT_FAILURE;
     }
+    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(firstBitSentTime.time_since_epoch()).count();
 
     std::cout << "START packet sent." << std::endl;
 
@@ -289,9 +270,9 @@ int main(int argc, char* argv[]) {
 
     bool endSendFailed = false;
     for (int i = 0; i < 5; ++i) {
-        bytesSent = send(sockfd, &endPacket, sizeof(endPacket), 0);
-        if (bytesSent < 0) {
-            perror("send END");
+    bytesSent = send(sockfd, &endPacket, sizeof(endPacket), 0);
+    if (bytesSent < 0) {
+        perror("send END");
             endSendFailed = true;
             break;
         }
@@ -305,12 +286,7 @@ int main(int argc, char* argv[]) {
     while (true) {
         Packet response{};
 
-        ssize_t n = recv(
-            sockfd,
-            &response,
-            sizeof(response),
-            0
-        );
+        ssize_t n = recv( sockfd, &response, sizeof(response), 0);
 
         if (n < 0) {
             perror("recv control packet");
@@ -318,50 +294,35 @@ int main(int argc, char* argv[]) {
         }
 
         if (response.type == PACKET_NACK) {
-            if (response.data_length > DATA_SIZE ||
-                response.data_length % sizeof(uint32_t) != 0) {
+            if (response.data_length > DATA_SIZE || response.data_length % sizeof(uint32_t) != 0) {
                 std::cerr << "Invalid NACK packet." << std::endl;
                 continue;
             }
 
-            size_t count =
-                response.data_length / sizeof(uint32_t);
+            size_t count = response.data_length / sizeof(uint32_t);
 
             std::vector<uint32_t> missingSequences(count);
 
-            memcpy(
-                missingSequences.data(),
-                response.data,
-                response.data_length
-            );
+            memcpy(missingSequences.data(), response.data, response.data_length);
 
-            std::cout << "Received NACK for "
-                      << count
-                      << " packets." << std::endl;
+            std::cout << "Received NACK for " << count << " packets." << std::endl;
 
             for (uint32_t seq : missingSequences) {
-                resend_packet(
-                    sockfd,
-                    args.file_path,
-                    seq,
-                    fileSize
-                );
+                retransmitCount++;
+                resend_packet(sockfd, args.file_path, seq, fileSize); // send retransmissions
             }
         }
         else if (response.type == PACKET_COMPLETE) {
-            std::cout << "Server confirmed file transfer complete."
-                      << std::endl;
+            std::cout << "Timestamp (First bit sent): " << duration_us << " us (epoch)" << std::endl;
+            std::cout << "Retransmitted: " << retransmitCount << "packets." << std::endl;
+            std::cout << "Server confirmed file transfer complete." << std::endl;
             break;
         }
         else {
-            std::cerr << "Unexpected control packet type: "
-                      << response.type << std::endl;
+            std::cerr << "Unexpected control packet type: " << response.type << std::endl;
         }
     }
 
     close(sockfd);
-
-    std::cout << "File transfer complete." << std::endl;
-
     return 0;
 }
