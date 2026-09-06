@@ -12,15 +12,191 @@
 #include <cstring>
 #include <cstdlib>
 
+#include <thread>
+#include <vector>
+#include <mutex>
+#include <algorithm>
+#include <chrono>
+#include <atomic>
+#include <future>
+
 #include "zap_protocol.hpp"
 #include "zap_cli.hpp"
+
+
+static std::mutex g_coutMutex;
+
+// DIAGNOSTIC: per-thread throughput, so you can see whether all threads are
+// actually sending at a comparable rate, and compute overall Mbps directly
+// instead of inferring it from wall-clock guesses.
+static std::atomic<uint64_t> g_totalBytesSent{0};
+static std::atomic<uint64_t> g_totalPacketsSent{0};
+
+static bool send_chunk(const std::string& filename,
+                        const std::string& serverIP,
+                        int port,
+                        uint64_t startOffset,
+                        uint64_t endOffset,
+                        uint32_t startSeq,
+                        int threadIndex) {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("socket creation failed (thread)");
+        return false;
+    }
+
+    // Bump the send buffer so a burst of back-to-back sendto() calls doesn't
+    // stall (or, worse, silently ENOBUFS-drop under Linux) waiting on the
+    // default socket send buffer (often ~208KB) to drain. This matters more
+    // as thread count / send rate goes up.
+    int sndbuf = 4 * 1024 * 1024;
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    {
+        int actualSndbuf = 0;
+        socklen_t optlen = sizeof(actualSndbuf);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &actualSndbuf, &optlen) == 0) {
+            std::lock_guard<std::mutex> lock(g_coutMutex);
+            std::cout << "[thread " << threadIndex << "] SO_SNDBUF actually granted: "
+                      << actualSndbuf << " bytes (requested " << sndbuf << ")" << std::endl;
+        }
+    }
+
+    struct sockaddr_in servaddr{};
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(port);
+    if (inet_pton(AF_INET, serverIP.c_str(), &servaddr.sin_addr) <= 0) {
+        std::cerr << "Invalid server IP address in thread " << threadIndex << std::endl;
+        close(sockfd);
+        return false;
+    }
+
+    if (connect(sockfd, reinterpret_cast<sockaddr*>(&servaddr), sizeof(servaddr)) < 0) {
+        perror("connect (thread)");
+        close(sockfd);
+        return false;
+    }
+
+    std::ifstream file(filename, std::ios::binary);
+
+    if (!file.is_open()) {
+        std::cerr << "Thread " << threadIndex << " could not open file" << std::endl;
+        close(sockfd);
+        return false;
+    }
+    file.seekg(static_cast<std::streamoff>(startOffset));
+
+    uint32_t sequence = startSeq;
+    uint64_t bytesRemaining = endOffset - startOffset;
+    uint64_t threadBytesSent = 0;
+    uint64_t threadPacketsSent = 0;
+    auto threadStart = std::chrono::steady_clock::now();
+
+    while (bytesRemaining > 0) {
+        Packet dataPacket{};
+        dataPacket.type = PACKET_DATA;
+        dataPacket.sequence = sequence;
+
+        uint32_t toRead = static_cast<uint32_t>(std::min<uint64_t>(DATA_SIZE, bytesRemaining));
+        file.read(dataPacket.data, toRead);
+        std::streamsize bytesRead = file.gcount();
+        if (bytesRead <= 0) break;
+
+        dataPacket.data_length = static_cast<uint32_t>(bytesRead);
+
+        ssize_t bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
+        if (bytesSent < 0) {
+            // ENOBUFS here means the kernel send buffer is full -- i.e. this
+            // thread is trying to push data out faster than the NIC/network
+            // path can drain it. That's a direct signal you're sending too
+            // fast for the link, which shows up downstream as receiver drops
+            // and retransmits even though the bug isn't on the receiver side.
+            perror("send (thread)");
+            break;
+        }
+
+        threadBytesSent += static_cast<uint64_t>(bytesRead);
+        threadPacketsSent++;
+        bytesRemaining -= static_cast<uint64_t>(bytesRead);
+        sequence++;
+    }
+
+    auto threadDurationSec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - threadStart).count();
+    double threadMbps = threadDurationSec > 0
+        ? (threadBytesSent * 8.0 / 1'000'000.0) / threadDurationSec
+        : 0.0;
+
+    g_totalBytesSent.fetch_add(threadBytesSent, std::memory_order_relaxed);
+    g_totalPacketsSent.fetch_add(threadPacketsSent, std::memory_order_relaxed);
+
+    {
+        std::lock_guard<std::mutex> lock(g_coutMutex);
+        std::cout << "[thread " << threadIndex << "] sent " << threadPacketsSent
+                  << " packets / " << threadBytesSent << " bytes in "
+                  << threadDurationSec << " s (" << threadMbps << " Mbps)" << std::endl;
+    }
+
+    file.close();
+    close(sockfd);
+    return true;
+}
+
 // TODO: 
 // notes: we should probs move the packet_start outside so that it must send an ack to confirm file can be sent. 
 // Then while loop for as long as it takes to recv all of the packets. then send an fin message - might be able to do away with the 
 // "PACKET_END" as in once all of the data from the file is sent and acked fully/
 // PACKET_START will likely need to specify how large the size of the file to be sent is - so the receiver can know how many packets to expect,etc
 
+static bool resend_packet(
+    int sockfd,
+    const std::string& filePath,
+    uint32_t sequence,
+    uint64_t fileSize)
+{
+    std::ifstream file(filePath, std::ios::binary);
+
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file for retransmission." << std::endl;
+        return false;
+    }
+
+    uint64_t offset =
+        static_cast<uint64_t>(sequence) * DATA_SIZE;
+
+    if (offset >= fileSize) {
+        std::cerr << "Invalid retransmission sequence: " << sequence << std::endl;
+        return false;
+    }
+
+    file.seekg(offset);
+
+    uint64_t remaining = fileSize - offset;
+    uint32_t bytesToRead = static_cast<uint32_t>( std::min<uint64_t>(DATA_SIZE, remaining));
+
+    Packet packet{};
+    packet.type = PACKET_DATA;
+    packet.sequence = sequence;
+    packet.data_length = bytesToRead;
+
+    file.read(packet.data, bytesToRead);
+
+    if (!file) {
+        std::cerr << "Failed to read packet " << sequence << std::endl;
+        return false;
+    }
+
+    ssize_t bytesSent = send(sockfd, &packet, sizeof(packet), 0);
+
+    if (bytesSent < 0) {
+        perror("send retransmission");
+        return false;
+    }
+
+    return true;
+}
+
 int main(int argc, char* argv[]) {
+    int retransmitCount = 0;
     Args args;
     if (!parse_args(argc, argv, &args)) {
         return EXIT_FAILURE;
@@ -39,11 +215,16 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Opened file: " << filename << std::endl;
 
+     // figure out the file size so we can split it into chunks
+    inputFile.seekg(0, std::ios::end);
+    uint64_t fileSize = static_cast<uint64_t>(inputFile.tellg());
+    inputFile.seekg(0, std::ios::beg);
+    uint32_t totalPackets = static_cast<uint32_t>((fileSize + DATA_SIZE - 1) / DATA_SIZE);
+
     // Create UDP socket
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("socket creation failed");
-        inputFile.close(); // close file here 
         exit(EXIT_FAILURE);
     }
 
@@ -61,8 +242,6 @@ int main(int argc, char* argv[]) {
             << "Invalid server IP address: "
             << serverIP
             << std::endl;
-
-        inputFile.close();
         close(sockfd);
 
         return EXIT_FAILURE;
@@ -71,7 +250,6 @@ int main(int argc, char* argv[]) {
     // connect UDP socket tyo server
     if (connect(sockfd, reinterpret_cast<sockaddr*>(&servaddr), sizeof(servaddr)) < 0) {
         perror("connect");
-        inputFile.close();
         close(sockfd);
         return EXIT_FAILURE;
     }
@@ -88,7 +266,6 @@ int main(int argc, char* argv[]) {
 
     if (packet.data_length == 0 || packet.data_length >= FILENAME_SIZE) {// check filename 
         std::cerr << "Filename is too long." << std::endl;
-        inputFile.close();
         close(sockfd);
         return EXIT_FAILURE;
     }
@@ -96,75 +273,129 @@ int main(int argc, char* argv[]) {
     // copy to data
     memcpy( packet.data,  savePath.c_str(), packet.data_length );
     // send data
+    auto firstBitSentTime = std::chrono::high_resolution_clock::now();
     ssize_t bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
-
     if (bytesSent < 0) {
         perror("send");
-        inputFile.close();
         close(sockfd);
         return EXIT_FAILURE;
     }
+    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(firstBitSentTime.time_since_epoch()).count();
 
     std::cout << "START packet sent." << std::endl;
 
 
     // send file 
-    uint32_t sequence = 0;
+    uint32_t packetsPerThread = (totalPackets + NUM_THREADS - 1) / NUM_THREADS;
 
-    while (true)
-    {
-        Packet dataPacket{};
+    // CHANGED: std::async + future<bool> instead of std::thread, so we can
+    // actually observe a send_chunk() failure instead of silently discarding
+    // its return value. Previously a failed sender thread looked identical
+    // to a successful one -- main() would just proceed to send END and let
+    // the NACK/repair mechanism "fix" what were actually thread failures,
+    // hiding the real problem behind an inflated retransmit count.
+    auto threadStart = std::chrono::steady_clock::now();
+    std::vector<std::future<bool>> futures;
+    for (int t = 0; t < NUM_THREADS; t++) {
+        uint32_t startSeq = static_cast<uint32_t>(t) * packetsPerThread;
+        if (startSeq >= totalPackets) break; 
+        
+    uint32_t endSeqExclusive = std::min(startSeq + packetsPerThread, totalPackets);
+    uint64_t startOffset = static_cast<uint64_t>(startSeq) * DATA_SIZE;
+    uint64_t endOffset = std::min(static_cast<uint64_t>(endSeqExclusive) * DATA_SIZE, fileSize);
 
-        dataPacket.type = PACKET_DATA; // #2
-        dataPacket.sequence = sequence;
+    futures.push_back(std::async(std::launch::async, send_chunk, args.file_path,
+                                  args.ip_address, args.port, startOffset, endOffset, startSeq, t));
 
-        // Read up to DATA_SIZE bytes of the file to be transferred
-        inputFile.read( dataPacket.data, DATA_SIZE );
-        std::streamsize bytesRead = inputFile.gcount();
-
-        // No more data
-        if (bytesRead == 0) { break; }
-
-        dataPacket.data_length = static_cast<uint32_t>(bytesRead);
-
-        // Send packet
-        bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
-
-        if (bytesSent < 0) { 
-            perror("send");
-            break;
-        }
-
-       if (sequence %100 == 0) {
-            std::cout << "Sent packet "  << sequence << " ("  << bytesRead << " bytes)" << std::endl;
-        }
-        sequence++;
     }
 
+    bool anyThreadFailed = false;
+    for (auto& fut : futures) {
+        if (!fut.get()) {
+            anyThreadFailed = true;
+        }
+    }
+    if (anyThreadFailed) {
+        std::cerr << "WARNING: at least one sender thread reported failure -- "
+                     "missing packets below may be due to that, not just network loss."
+                  << std::endl;
+    }
+
+    double overallSendDurationSec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - threadStart).count();
+    double overallMbps = overallSendDurationSec > 0
+        ? (g_totalBytesSent.load() * 8.0 / 1'000'000.0) / overallSendDurationSec
+        : 0.0;
+    std::cout << "[instrumentation] initial send pass: " << g_totalPacketsSent.load()
+              << " packets / " << g_totalBytesSent.load() << " bytes in "
+              << overallSendDurationSec << " s -> " << overallMbps
+              << " Mbps aggregate across " << futures.size() << " threads"
+              << std::endl;
+    
+    std::cout << "All " << futures.size() << " sender threads finished (" << totalPackets << " packets total)." << std::endl;
 
     // end msg
     Packet endPacket{}; 
 
     endPacket.type = PACKET_END;
-    endPacket.sequence = sequence;
+    endPacket.sequence = totalPackets;
     endPacket.data_length = 0;
 
-
-    bytesSent = send( sockfd, &endPacket, sizeof(endPacket), 0);
-
-    if (bytesSent < 0) { 
-        perror("send");
+    bool endSendFailed = false;
+    for (int i = 0; i < 5; ++i) {
+    bytesSent = send(sockfd, &endPacket, sizeof(endPacket), 0);
+    if (bytesSent < 0) {
+        perror("send END");
+            endSendFailed = true;
+            break;
+        }
     }
-    else{
-        std::cout << "END packet sent." << std::endl;
+    
+    if (!endSendFailed) {
+        std::cout << "END packet sent 5 times." << std::endl;
+    }
+    std::cout << "Waiting for NACK or COMPLETE..." << std::endl;
+
+    while (true) {
+        Packet response{};
+
+        ssize_t n = recv( sockfd, &response, sizeof(response), 0);
+
+        if (n < 0) {
+            perror("recv control packet");
+            break;
+        }
+
+        if (response.type == PACKET_NACK) {
+            if (response.data_length > DATA_SIZE || response.data_length % sizeof(uint32_t) != 0) {
+                std::cerr << "Invalid NACK packet." << std::endl;
+                continue;
+            }
+
+            size_t count = response.data_length / sizeof(uint32_t);
+
+            std::vector<uint32_t> missingSequences(count);
+
+            memcpy(missingSequences.data(), response.data, response.data_length);
+
+            std::cout << "Received NACK for " << count << " packets." << std::endl;
+
+            for (uint32_t seq : missingSequences) {
+                retransmitCount++;
+                resend_packet(sockfd, args.file_path, seq, fileSize); // send retransmissions
+            }
+        }
+        else if (response.type == PACKET_COMPLETE) {
+            std::cout << "Timestamp (First bit sent): " << duration_us << " us (epoch)" << std::endl;
+            std::cout << "Retransmitted: " << retransmitCount << "packets." << std::endl;
+            std::cout << "Server confirmed file transfer complete." << std::endl;
+            break;
+        }
+        else {
+            std::cerr << "Unexpected control packet type: " << response.type << std::endl;
+        }
     }
 
-    // cleanup
-    inputFile.close();
     close(sockfd);
-
-
-    std::cout << "File transfer complete." << std::endl;
-
     return 0;
 }
