@@ -215,6 +215,9 @@ int main(int argc, char* argv[]) {
     packet.type = PACKET_START;
     packet.sequence = 0;
 
+    packet.file_size = fileSize;
+    packet.total_packets = totalPackets;
+
     std::string savePath = args.save_dir.empty() ? args.file_path : args.save_dir;
     packet.data_length = savePath.size();
 
@@ -314,7 +317,7 @@ int main(int argc, char* argv[]) {
         }
         else if (response.type == PACKET_COMPLETE) {
             std::cout << "Timestamp (First bit sent): " << duration_us << " us (epoch)" << std::endl;
-            std::cout << "Retransmitted: " << retransmitCount << "packets." << std::endl;
+            std::cout << "Retransmitted: " << retransmitCount << " packets." << std::endl;
             std::cout << "Server confirmed file transfer complete." << std::endl;
             break;
         }

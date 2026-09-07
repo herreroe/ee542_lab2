@@ -21,6 +21,10 @@ struct Packet
     uint32_t type;
     uint32_t sequence;
     uint32_t data_length;
+
+    uint64_t file_size;
+    uint32_t total_packets;
+    
     char data[DATA_SIZE];
 };
 

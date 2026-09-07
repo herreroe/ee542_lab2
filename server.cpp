@@ -25,10 +25,16 @@
 
 struct ReceiverState {
     std::mutex fileMutex;
-    FILE* outputFile = nullptr;
     bool receivingFile = false;
-    std::unordered_set<uint32_t> receivedSequences;
 
+    std::string outputFilename;
+
+    std::vector<char> fileBuffer;
+    std::vector<uint8_t> received;
+
+    uint64_t fileSize = 0;
+    uint32_t totalPackets = 0;
+    
     std::mutex clientMutex;
     sockaddr_in clientAddress{};
     bool clientAddressKnown = false;
@@ -140,19 +146,20 @@ int optval = 1;
         // Start msg
         if (packet.type == PACKET_START) {
             std::lock_guard<std::mutex> lock(state.fileMutex);
-            if (state.outputFile == nullptr) {
+            if (!state.receivingFile) {
                 std::cout << "[thread " << threadIndex << "] Received START packet." << std::endl;
-                state.receivedSequences.clear();
-                std::string filename(packet.data, packet.data_length);
+                
+                state.outputFilename = std::string (packet.data, packet.data_length);
 
-                state.outputFile = fopen(filename.c_str(), "wb");
-                if (state.outputFile == nullptr) {
-                    perror("Failed to open output file");
-                    state.receivingFile = false;
-                } else {
-                    state.receivingFile = true;
-                    std::cout << "[thread " << threadIndex << "] Opened " << filename << " for writing." << std::endl;
-                }
+                state.fileSize = packet.file_size;
+                state.totalPackets = packet.total_packets;
+
+                state.fileBuffer.resize(state.fileSize);
+                state.received.assign(state.totalPackets, 0);
+
+                state.receivingFile = true;
+
+                std::cout << "[thread " << threadIndex << "] Prepared " << state.fileSize << " bytes in memory for " <<state.totalPackets << " packets." << std::endl;
             }
 
         }
@@ -166,33 +173,30 @@ int optval = 1;
                 continue;
             }
 
+            if (packet.sequence >= state.totalPackets) {
+                std::cerr << "[thread " << threadIndex << "] Invalid sequence: " << packet.sequence << std::endl;
+                continue;
+            }
+
+            if (packet.data_length > DATA_SIZE) {
+                std::cerr << "[thread " << threadIndex << "] Invalid DATA length." << std::endl;
+                continue;
+            }
+
             // duplicate packet check
             // if sequence number is already in the set, drop this copy and keep original
-            if (state.receivedSequences.find(packet.sequence) != state.receivedSequences.end()) {
+            if (state.received[packet.sequence]) {
                 continue;
             }
 
-            // order by sequence number
-            // seek where the chunk belongs in the file before writing it
-            long offset = static_cast<long>(packet.sequence) * static_cast<long>(DATA_SIZE);
-            if (fseek(state.outputFile, offset, SEEK_SET) != 0) {
-                perror("fseek");
-                continue;
-            }
+            uint64_t offset = static_cast<uint64_t>(packet.sequence) * DATA_SIZE;
 
-            size_t bytesWritten = fwrite(packet.data, 1, packet.data_length, state.outputFile);
-            if (bytesWritten != packet.data_length) {
-                std::cerr << "[thread " << threadIndex << "] Failed to write all data" << std::endl;
-                fclose(state.outputFile);
-                state.outputFile = nullptr;
-                state.receivingFile = false;
-                break;
-            }
+            std::memcpy(state.fileBuffer.data() + offset, packet.data, packet.data_length);
 
-            state.receivedSequences.insert(packet.sequence);
+            state.received[packet.sequence] = 1;
 
-            if (packet.sequence %1000 == 0) { // occasional
-                std::cout << "[thread " << threadIndex << "] Received packets " << packet.sequence << " (" << packet.data_length  << " bytes)" << std::endl;
+            if (packet.sequence % 1000 == 0) {
+                std::cout << "[thread " << threadIndex << "] Received packet " << packet.sequence << " (" << packet.data_length << " bytes)" << std::endl;
             }
         }
         // end msg
@@ -235,8 +239,8 @@ int main() {
 
     std::cout << "Expected DATA packets: " << totalPackets << std::endl;
 
-    if (state.outputFile == nullptr) {
-        std::cerr << "Output file is not available." << std::endl;
+    if (!state.receivingFile) {
+        std::cerr << "No file transfer was started." << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -250,7 +254,6 @@ int main() {
                 << "Cannot repair transfer: client address is unknown."
                 << std::endl;
 
-            fclose(state.outputFile);
             return EXIT_FAILURE;
         }
 
@@ -263,7 +266,6 @@ int main() {
 
     if (repairSock < 0) {
         perror("socket creation failed (repair)");
-        fclose(state.outputFile);
         return EXIT_FAILURE;
     }
 
@@ -275,7 +277,6 @@ int main() {
     if (bind( repairSock, reinterpret_cast<sockaddr*>(&repairAddress), sizeof(repairAddress)) < 0) {
         perror("bind failed (repair)");
         close(repairSock);
-        fclose(state.outputFile);
         return EXIT_FAILURE;
     }
 
@@ -296,12 +297,11 @@ int main() {
 
         // Check the entire sequence range again
         for (uint32_t seq = 0; seq < totalPackets; ++seq) {
-            if (state.receivedSequences.find(seq) == state.receivedSequences.end()) {
+            if (!state.received[seq]) {
                 missingPackets.push_back(seq);
             }
         }
 
-        std::cout << "Received DATA packets: " << state.receivedSequences.size() << std::endl;
         std::cout << "Missing DATA packets: " << missingPackets.size() << std::endl;
 
         // Everything has arrived
@@ -309,6 +309,35 @@ int main() {
             auto finalRecvTime = std::chrono::high_resolution_clock::now();
             auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(finalRecvTime.time_since_epoch()).count();
             std::cout << "Timestamp (Final bit received): " << duration_us << " us (epoch)" << std::endl;            
+            
+            FILE* outputFile = fopen(state.outputFilename.c_str(), "wb");
+
+            if (outputFile == nullptr) {
+                perror("Failed to open output file");
+                break;
+            }
+
+            size_t bytesWritten = fwrite(
+                state.fileBuffer.data(),
+                1,
+                state.fileSize,
+                outputFile
+            );
+
+            fclose(outputFile);
+
+            auto writeCompleteTime = std::chrono::high_resolution_clock::now();
+            auto writeComplete_us = std::chrono::duration_cast<std::chrono::microseconds>(writeCompleteTime.time_since_epoch()).count();
+            
+            std::cout << "Timestamp (File write completed): " << writeComplete_us << " us (epoch)" << std::endl;
+            
+            if (bytesWritten != state.fileSize) {
+                std::cerr << "Failed to write complete file." << std::endl;
+                break;
+            }
+
+            std::cout << "File written to disk: " << state.outputFilename << std::endl;
+
             Packet completePacket{};
             completePacket.type = PACKET_COMPLETE;
             completePacket.data_length = 0;
@@ -369,38 +398,19 @@ int main() {
                 continue;
             }
 
-            // Already received this sequence
-            if (state.receivedSequences.find(repairPacket.sequence) != state.receivedSequences.end()) {
+            if (state.received[repairPacket.sequence]) {
                 continue;
             }
 
-            long offset = static_cast<long>(repairPacket.sequence) * static_cast<long>(DATA_SIZE);
+            uint64_t offset = static_cast<uint64_t>(repairPacket.sequence) * DATA_SIZE;
 
-            if (fseek(state.outputFile, offset, SEEK_SET) != 0) {
-                perror("fseek repair");
-                continue;
-            }
+            std::memcpy(state.fileBuffer.data() + offset, repairPacket.data, repairPacket.data_length);
 
-            size_t bytesWritten = fwrite(repairPacket.data, 1, repairPacket.data_length, state.outputFile);
-
-            if (bytesWritten !=
-                repairPacket.data_length) {
-                std::cerr << "Failed to write retransmitted packet " << repairPacket.sequence << std::endl;
-                continue;
-            }
-
-            state.receivedSequences.insert(
-                repairPacket.sequence
-            );
+            state.received[repairPacket.sequence] = 1 ;
         }
     }
 
     close(repairSock);
-
-    if (state.outputFile != nullptr) {
-        fflush(state.outputFile);
-        fclose(state.outputFile);
-    }
 
     return 0;
 }
