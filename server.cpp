@@ -25,10 +25,6 @@
 
 
 struct ReceiverState {
-    // Everything below is written once, under startMutex, when the START
-    // packet is processed, then published to the other receiver thread(s)
-    // via the `ready` flag - so the DATA hot path never has to take a lock
-    // or hash into an unordered_set; it just does an atomic check + pwrite.
     std::mutex startMutex;
     int outputFd = -1;
     uint32_t chunkSize = 0;
@@ -48,10 +44,7 @@ struct ReceiverState {
 };
 
 static bool send_nack_packets(int sockfd, const std::vector<uint32_t>& missingPackets, const sockaddr_in& clientAddress, uint32_t chunkSize) {
-    // Cap each NACK packet's payload by the negotiated per-packet budget
-    // for this link (the same chunkSize DATA packets use), not by the
-    // max buffer capacity - otherwise a full batch could still exceed
-    // the path MTU and fail with EMSGSIZE on low-MTU links.
+    
     size_t maxSeqsPerNack = std::max<size_t>(1, chunkSize / sizeof(uint32_t));
 
     for (size_t i = 0; i < missingPackets.size(); i += maxSeqsPerNack) {

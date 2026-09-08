@@ -56,8 +56,8 @@ inline uint32_t detect_payload_size(int sockfd) {
         return 1024;
     }
 
-    uint32_t usable = static_cast<uint32_t>(mtu) > (IP_UDP_HEADER_OVERHEAD + PACKET_HEADER_SIZE)
-                           ? static_cast<uint32_t>(mtu) - IP_UDP_HEADER_OVERHEAD - static_cast<uint32_t>(PACKET_HEADER_SIZE)
+    uint32_t usable = static_cast<uint32_t>(mtu) > (IP_UDP_HEADER_SIZE + PACKET_HEADER_SIZE)
+                           ? static_cast<uint32_t>(mtu) - IP_UDP_HEADER_SIZE - static_cast<uint32_t>(PACKET_HEADER_SIZE)
                            : MIN_DATA_SIZE;
     return std::min(std::max(usable, MIN_DATA_SIZE), MAX_DATA_SIZE);
 }
