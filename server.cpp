@@ -302,7 +302,10 @@ int main() {
             }
         }
 
+        uint32_t receivedPackets = totalPackets - static_cast<uint32_t>(missingPackets.size());
+        std::cout << "Received DATA packets: " << receivedPackets << " / " << totalPackets << std::endl;
         std::cout << "Missing DATA packets: " << missingPackets.size() << std::endl;
+
 
         // Everything has arrived
         if (missingPackets.empty()) {
