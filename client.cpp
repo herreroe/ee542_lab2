@@ -29,7 +29,8 @@ static bool send_chunk(const std::string& filename,
                         uint64_t startOffset,
                         uint64_t endOffset,
                         uint32_t startSeq,
-                        int threadIndex) {
+                        int threadIndex,
+                        uint32_t chunkSize) {
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("socket creation failed (thread)");
@@ -68,7 +69,7 @@ static bool send_chunk(const std::string& filename,
         dataPacket.type = PACKET_DATA;
         dataPacket.sequence = sequence;
 
-        uint32_t toRead = static_cast<uint32_t>(std::min<uint64_t>(DATA_SIZE, bytesRemaining));
+        uint32_t toRead = static_cast<uint32_t>(std::min<uint64_t>(chunkSize, bytesRemaining));
         file.read(dataPacket.data, toRead);
         std::streamsize bytesRead = file.gcount();
         if (bytesRead <= 0) break;
@@ -99,7 +100,8 @@ static bool resend_packet(
     int sockfd,
     const std::string& filePath,
     uint32_t sequence,
-    uint64_t fileSize)
+    uint64_t fileSize,
+    uint32_t chunkSize)
 {
     std::ifstream file(filePath, std::ios::binary);
 
@@ -109,7 +111,7 @@ static bool resend_packet(
     }
 
     uint64_t offset =
-        static_cast<uint64_t>(sequence) * DATA_SIZE;
+        static_cast<uint64_t>(sequence) * chunkSize;
 
     if (offset >= fileSize) {
         std::cerr << "Invalid retransmission sequence: " << sequence << std::endl;
@@ -119,7 +121,7 @@ static bool resend_packet(
     file.seekg(offset);
 
     uint64_t remaining = fileSize - offset;
-    uint32_t bytesToRead = static_cast<uint32_t>( std::min<uint64_t>(DATA_SIZE, remaining));
+    uint32_t bytesToRead = static_cast<uint32_t>( std::min<uint64_t>(chunkSize, remaining));
 
     Packet packet{};
     packet.type = PACKET_DATA;
@@ -167,7 +169,6 @@ int main(int argc, char* argv[]) {
     inputFile.seekg(0, std::ios::end);
     uint64_t fileSize = static_cast<uint64_t>(inputFile.tellg()); // tellg gets end of file from seekg
     inputFile.seekg(0, std::ios::beg); // set back tobeginning
-    uint32_t totalPackets = static_cast<uint32_t>((fileSize + DATA_SIZE - 1) / DATA_SIZE);
 
     // Create UDP socket
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -199,10 +200,16 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "UDP socket connected to " << serverIP << ":" << args.port << std::endl;
+    uint32_t chunkSize = detect_payload_size(sockfd);
+    std::cout << "Negotiated payload size: " << chunkSize << " bytes/packet (based on path MTU)." << std::endl;
+
+    uint32_t totalPackets = static_cast<uint32_t>((fileSize + chunkSize - 1) / chunkSize);
 
     Packet packet{};
     packet.type = PACKET_START;
     packet.sequence = 0;
+    packet.file_size = fileSize;
+    packet.chunk_size = chunkSize;
 
     std::string savePath = args.save_dir.empty() ? args.file_path : args.save_dir;
     packet.data_length = savePath.size();
@@ -236,10 +243,10 @@ int main(int argc, char* argv[]) {
         if (startSeq >= totalPackets) break; 
         
         uint32_t endSeqExclusive = std::min(startSeq + packetsPerThread, totalPackets);
-        uint64_t startOffset = static_cast<uint64_t>(startSeq) * DATA_SIZE;
-        uint64_t endOffset = std::min(static_cast<uint64_t>(endSeqExclusive) * DATA_SIZE, fileSize);
+        uint64_t startOffset = static_cast<uint64_t>(startSeq) * chunkSize;
+        uint64_t endOffset = std::min(static_cast<uint64_t>(endSeqExclusive) * chunkSize, fileSize);
 
-        threads.emplace_back(send_chunk, filename, args.ip_address, args.port, startOffset, endOffset, startSeq, t);
+        threads.emplace_back(send_chunk, filename, args.ip_address, args.port, startOffset, endOffset, startSeq, t, chunkSize);
     }
 
     for (auto& th : threads) {
@@ -279,7 +286,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (response.type == PACKET_NACK) {
-            if (response.data_length > DATA_SIZE || response.data_length % sizeof(uint32_t) != 0) { //corrupted
+            if (response.data_length > MAX_DATA_SIZE || response.data_length % sizeof(uint32_t) != 0) { //corrupted
                 std::cerr << "Invalid NACK packet." << std::endl;
                 continue;
             }
@@ -294,7 +301,7 @@ int main(int argc, char* argv[]) {
 
             for (uint32_t seq : missingSequences) {
                 retransmitCount++;
-                resend_packet(sockfd, args.file_path, seq, fileSize); // send retransmissions
+                resend_packet(sockfd, args.file_path, seq, fileSize, chunkSize); // send retransmissions
             }
         }
         else if (response.type == PACKET_COMPLETE) {
