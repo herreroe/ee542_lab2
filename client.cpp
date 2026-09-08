@@ -229,7 +229,7 @@ int main(int argc, char* argv[]) {
         close(sockfd);
         return EXIT_FAILURE;
     }
-    auto duration_us = std::chrono::duration_cast<std::chrono::seconds>(firstBitSentTime.time_since_epoch()).count(); // keep as micro seconds b/c higher precision compared to sec
+    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(firstBitSentTime.time_since_epoch()).count(); // keep as micro seconds b/c higher precision compared to sec
 
     std::cout << "START packet sent." << std::endl;
 
