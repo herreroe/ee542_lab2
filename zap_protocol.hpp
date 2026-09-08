@@ -1,18 +1,19 @@
 #ifndef ZAP_PROTOCOL_HPP
 #define ZAP_PROTOCOL_HPP
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <algorithm>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
 #ifndef IP_MTU
-#define IP_MTU 14
+#define IP_MTU 14 // Linux value; not always exposed via <netinet/in.h>
 #endif
 
 constexpr uint16_t SERVER_PORT = 8080;
 
-constexpr uint32_t MAX_DATA_SIZE = 8900; // max possible based on lab mtu testing
+constexpr uint32_t MAX_DATA_SIZE = 8900;
 constexpr uint32_t FILENAME_SIZE = 256;
 constexpr uint32_t MIN_DATA_SIZE = 1024;
 
@@ -39,23 +40,26 @@ struct Packet
     char data[MAX_DATA_SIZE];
 };
 
+constexpr size_t PACKET_HEADER_SIZE = offsetof(Packet, data);
+inline size_t packet_wire_size(const Packet& p) {
+    return PACKET_HEADER_SIZE + p.data_length;
+}
 inline uint32_t detect_payload_size(int sockfd) {
     int mtu = 0;
     socklen_t len = sizeof(mtu);
 
     int val = IP_PMTUDISC_DO;
     setsockopt(sockfd, IPPROTO_IP, IP_MTU_DISCOVER, &val, sizeof(val)); 
-    
+
     if (getsockopt(sockfd, IPPROTO_IP, IP_MTU, &mtu, &len) < 0 || mtu <= 0) {
         perror("getsockopt(IP_MTU) failed, falling back to default payload size");
         return 1024;
     }
 
-    constexpr uint32_t headerSize = static_cast<uint32_t>(sizeof(Packet) - MAX_DATA_SIZE);
-    uint32_t usable = static_cast< uint32_t>(mtu) > (IP_UDP_HEADER_SIZE + headerSize)
-                           ? static_cast<uint32_t>(mtu) - IP_UDP_HEADER_SIZE - headerSize
+    uint32_t usable = static_cast<uint32_t>(mtu) > (IP_UDP_HEADER_OVERHEAD + PACKET_HEADER_SIZE)
+                           ? static_cast<uint32_t>(mtu) - IP_UDP_HEADER_OVERHEAD - static_cast<uint32_t>(PACKET_HEADER_SIZE)
                            : MIN_DATA_SIZE;
-    return std::min(std::max(usable, MIN_DATA_SIZE), MAX_DATA_SIZE); // ensure size is within max/min
+    return std::min(std::max(usable, MIN_DATA_SIZE), MAX_DATA_SIZE);
 }
 
 #endif

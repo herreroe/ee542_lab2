@@ -76,7 +76,7 @@ static bool send_chunk(const std::string& filename,
 
         dataPacket.data_length = static_cast<uint32_t>(bytesRead);
 
-        ssize_t bytesSent = send(sockfd, &dataPacket, sizeof(dataPacket), 0);
+        ssize_t bytesSent = send(sockfd, &dataPacket, packet_wire_size(dataPacket), 0);
         if (bytesSent < 0) {
             perror("send (thread)");
             break;
@@ -135,7 +135,7 @@ static bool resend_packet(
         return false;
     }
 
-    ssize_t bytesSent = send(sockfd, &packet, sizeof(packet), 0);
+    ssize_t bytesSent = send(sockfd, &packet, packet_wire_size(packet), 0);
 
     if (bytesSent < 0) {
         perror("send retransmission");
@@ -223,7 +223,7 @@ int main(int argc, char* argv[]) {
     memcpy( packet.data,  savePath.c_str(), packet.data_length );
 
     auto firstBitSentTime = std::chrono::high_resolution_clock::now(); // record when first bit is sent -- should this be changes to when the first bit of payload is sent?
-    ssize_t bytesSent = send(sockfd, &packet,  sizeof(packet), 0);
+    ssize_t bytesSent = send(sockfd, &packet,  packet_wire_size(packet), 0);
     if (bytesSent < 0) {
         perror("send");
         close(sockfd);
@@ -263,7 +263,7 @@ int main(int argc, char* argv[]) {
 
     bool endSendFailed = false;
     for (int i = 0; i < 5; ++i) {
-    bytesSent = send(sockfd, &endPacket, sizeof(endPacket), 0);
+    bytesSent = send(sockfd, &endPacket, packet_wire_size(endPacket), 0);
     if (bytesSent < 0) {
         perror("send END");
             endSendFailed = true;

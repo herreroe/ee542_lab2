@@ -47,14 +47,18 @@ struct ReceiverState {
     std::atomic<uint32_t> finalTotalPackets{0};
 };
 
-static bool send_nack_packets(int sockfd, const std::vector<uint32_t>& missingPackets, const sockaddr_in& clientAddress) {
-    constexpr size_t MAX_SEQS_PER_NACK = MAX_DATA_SIZE / sizeof(uint32_t);
+static bool send_nack_packets(int sockfd, const std::vector<uint32_t>& missingPackets, const sockaddr_in& clientAddress, uint32_t chunkSize) {
+    // Cap each NACK packet's payload by the negotiated per-packet budget
+    // for this link (the same chunkSize DATA packets use), not by the
+    // max buffer capacity - otherwise a full batch could still exceed
+    // the path MTU and fail with EMSGSIZE on low-MTU links.
+    size_t maxSeqsPerNack = std::max<size_t>(1, chunkSize / sizeof(uint32_t));
 
-    for (size_t i = 0; i < missingPackets.size(); i += MAX_SEQS_PER_NACK) {
+    for (size_t i = 0; i < missingPackets.size(); i += maxSeqsPerNack) {
         Packet nackPacket{};
         nackPacket.type = PACKET_NACK;
 
-        size_t count = std::min(MAX_SEQS_PER_NACK, missingPackets.size() - i);
+        size_t count = std::min(maxSeqsPerNack, missingPackets.size() - i);
 
         memcpy(nackPacket.data, missingPackets.data() + i, count * sizeof(uint32_t));
 
@@ -63,7 +67,7 @@ static bool send_nack_packets(int sockfd, const std::vector<uint32_t>& missingPa
         ssize_t bytesSent = sendto(
             sockfd,
             &nackPacket,
-            sizeof(nackPacket),
+            packet_wire_size(nackPacket),
             0,
             reinterpret_cast<const sockaddr*>(&clientAddress),
             sizeof(clientAddress)
@@ -348,7 +352,7 @@ int main() {
             ssize_t bytesSent = sendto(
                 repairSock,
                 &completePacket,
-                sizeof(completePacket),
+                packet_wire_size(completePacket),
                 0,
                 reinterpret_cast<const sockaddr*>(&clientAddr),
                 sizeof(clientAddr)
@@ -364,7 +368,7 @@ int main() {
         }
 
         // Tell client which packets are still missing
-        if (!send_nack_packets(repairSock, missingPackets, clientAddr)) {
+        if (!send_nack_packets(repairSock, missingPackets, clientAddr, state.chunkSize)) {
             std::cerr << "Failed to send NACK packets." << std::endl;
             break;
         }
