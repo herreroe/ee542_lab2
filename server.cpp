@@ -34,6 +34,7 @@ struct ReceiverState {
 
     uint64_t fileSize = 0;
     uint32_t totalPackets = 0;
+    uint32_t chunkSize = 0;
     
     std::mutex clientMutex;
     sockaddr_in clientAddress{};
@@ -46,16 +47,16 @@ struct ReceiverState {
 static bool send_nack_packets(
     int sockfd,
     const std::vector<uint32_t>& missingPackets,
-    const sockaddr_in& clientAddress)
+    const sockaddr_in& clientAddress,
+    uint32_t chunkSize)
 {
-    constexpr size_t MAX_SEQS_PER_NACK =
-        DATA_SIZE / sizeof(uint32_t);
+    size_t maxSeqsPerNack = std::max<size_t>(1, chunkSize / sizeof(uint32_t));
 
-    for (size_t i = 0; i < missingPackets.size(); i += MAX_SEQS_PER_NACK) {
+    for (size_t i = 0; i < missingPackets.size(); i += maxSeqsPerNack) {
         Packet nackPacket{};
         nackPacket.type = PACKET_NACK;
 
-        size_t count = std::min(MAX_SEQS_PER_NACK, missingPackets.size() - i);
+        size_t count = std::min(maxSeqsPerNack, missingPackets.size() - i);
 
         memcpy( nackPacket.data, missingPackets.data() + i, count * sizeof(uint32_t));
 
@@ -64,7 +65,7 @@ static bool send_nack_packets(
         ssize_t bytesSent = sendto(
             sockfd,
             &nackPacket,
-            sizeof(nackPacket),
+            packet_wire_size(nackPacket),
             0,
             reinterpret_cast<const sockaddr*>(&clientAddress),
             sizeof(clientAddress)
@@ -153,6 +154,7 @@ int optval = 1;
 
                 state.fileSize = packet.file_size;
                 state.totalPackets = packet.total_packets;
+                state.chunkSize = std::min(std::max(packet.chunk_size, MIN_DATA_SIZE), MAX_DATA_SIZE);
 
                 state.fileBuffer.resize(state.fileSize);
                 state.received.assign(state.totalPackets, 0);
@@ -178,7 +180,7 @@ int optval = 1;
                 continue;
             }
 
-            if (packet.data_length > DATA_SIZE) {
+            if (packet.data_length > state.chunkSize) {
                 std::cerr << "[thread " << threadIndex << "] Invalid DATA length." << std::endl;
                 continue;
             }
@@ -189,7 +191,7 @@ int optval = 1;
                 continue;
             }
 
-            uint64_t offset = static_cast<uint64_t>(packet.sequence) * DATA_SIZE;
+            uint64_t offset = static_cast<uint64_t>(packet.sequence) * state.chunkSize;
 
             std::memcpy(state.fileBuffer.data() + offset, packet.data, packet.data_length);
 
@@ -348,7 +350,7 @@ int main() {
             ssize_t bytesSent = sendto(
                 repairSock,
                 &completePacket,
-                sizeof(completePacket),
+                packet_wire_size(completePacket),
                 0,
                 reinterpret_cast<const sockaddr*>(&clientAddr),
                 sizeof(clientAddr)
@@ -364,7 +366,7 @@ int main() {
         }
 
         // Tell client which packets are still missing
-        if (!send_nack_packets(repairSock, missingPackets, clientAddr)) {
+        if (!send_nack_packets(repairSock, missingPackets, clientAddr, state.chunkSize)) {
             std::cerr << "Failed to send NACK packets." << std::endl;
             break;
         }
@@ -396,7 +398,7 @@ int main() {
                 continue;
             }
 
-            if (repairPacket.data_length > DATA_SIZE) {
+            if (repairPacket.data_length > state.chunkSize) {
                 std::cerr << "Invalid retransmitted packet length." << std::endl;
                 continue;
             }
@@ -405,7 +407,7 @@ int main() {
                 continue;
             }
 
-            uint64_t offset = static_cast<uint64_t>(repairPacket.sequence) * DATA_SIZE;
+            uint64_t offset = static_cast<uint64_t>(repairPacket.sequence) * state.chunkSize;
 
             std::memcpy(state.fileBuffer.data() + offset, repairPacket.data, repairPacket.data_length);
 
