@@ -50,13 +50,13 @@ static bool send_nack_packets(
     const sockaddr_in& clientAddress,
     uint32_t chunkSize)
 {
-    size_t maxSeqsPerNack = std::max<size_t>(1, chunkSize / sizeof(uint32_t));
+    constexpr size_t MAX_SEQS_PER_NACK = 256;
 
-    for (size_t i = 0; i < missingPackets.size(); i += maxSeqsPerNack) {
+    for (size_t i = 0; i < missingPackets.size(); i += MAX_SEQS_PER_NACK) {
         Packet nackPacket{};
         nackPacket.type = PACKET_NACK;
 
-        size_t count = std::min(maxSeqsPerNack, missingPackets.size() - i);
+        size_t count = std::min(MAX_SEQS_PER_NACK, missingPackets.size() - i);
 
         memcpy( nackPacket.data, missingPackets.data() + i, count * sizeof(uint32_t));
 

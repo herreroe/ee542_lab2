@@ -290,6 +290,19 @@ int main(int argc, char* argv[]) {
     if (!endSendFailed) {
         std::cout << "END packet sent 5 times." << std::endl;
     }
+    struct timeval controlTimeout{};
+    controlTimeout.tv_sec = 3;
+    controlTimeout.tv_usec = 0;
+
+    if (setsockopt(
+            sockfd,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &controlTimeout,
+            sizeof(controlTimeout)
+        ) < 0) {
+        perror("setsockopt(SO_RCVTIMEO)");
+    }
     std::cout << "Waiting for NACK or COMPLETE..." << std::endl;
 
     while (true) {
@@ -298,7 +311,15 @@ int main(int argc, char* argv[]) {
         ssize_t n = recv( sockfd, &response, sizeof(response), 0);
 
         if (n < 0) {
-            perror("recv control packet");
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                std::cerr
+                    << "Control receive timeout while waiting for NACK/COMPLETE."
+                    << std::endl;
+            }
+            else {
+                perror("recv control packet");
+            }
+
             break;
         }
 
