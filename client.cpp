@@ -82,6 +82,11 @@ static bool send_chunk(const std::string& filename,
             perror("send (thread)");
             break;
         }
+        if (chunkSize > 1500) {
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(1500)
+            );
+        }
 
         bytesRemaining -= static_cast<uint64_t>(bytesRead);
         sequence++;
