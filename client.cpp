@@ -279,12 +279,22 @@ int main(int argc, char* argv[]) {
 
     bool endSendFailed = false;
     for (int i = 0; i < 5; ++i) {
-    bytesSent = send(sockfd, &endPacket, packet_wire_size(endPacket), 0);
-    if (bytesSent < 0) {
-        perror("send END");
+        bytesSent = send(
+            sockfd,
+            &endPacket,
+            packet_wire_size(endPacket),
+            0
+        );
+
+        if (bytesSent < 0) {
+            perror("send END");
             endSendFailed = true;
             break;
         }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(50)
+        );
     }
     
     if (!endSendFailed) {
@@ -313,13 +323,25 @@ int main(int argc, char* argv[]) {
         if (n < 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
                 std::cerr
-                    << "Control receive timeout while waiting for NACK/COMPLETE."
+                    << "Control receive timeout. Resending END..."
                     << std::endl;
-            }
-            else {
-                perror("recv control packet");
+
+                ssize_t resendEnd = send(
+                    sockfd,
+                    &endPacket,
+                    packet_wire_size(endPacket),
+                    0
+                );
+
+                if (resendEnd < 0) {
+                    perror("resend END");
+                    break;
+                }
+
+                continue;
             }
 
+            perror("recv control packet");
             break;
         }
 
