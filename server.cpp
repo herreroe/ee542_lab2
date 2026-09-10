@@ -1,7 +1,5 @@
 // Server side implementation of UDP client-server model - side that will be "receiving" the file
-// https://www.geeksforgeeks.org/cpp/udp-server-client-implementation-c/
 
-#include <bits/stdc++.h> 
 #include <stdlib.h> 
 #include <unistd.h> 
 #include <string.h> 
@@ -14,9 +12,9 @@
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
-
 #include <thread>
 #include <vector>
+#include <memory>
 #include <mutex>
 #include <atomic>
 
@@ -24,13 +22,14 @@
 
 
 struct ReceiverState {
-    std::mutex fileMutex;
-    bool receivingFile = false;
+    std::mutex startMutex;
+    std::atomic<bool> ready{false};
 
     std::string outputFilename;
 
     std::vector<char> fileBuffer;
-    std::vector<uint8_t> received;
+    std::unique_ptr<std::atomic<bool>[]> receivedFlags;
+    std::atomic<uint32_t> receivedCount{0};
 
     uint64_t fileSize = 0;
     uint32_t totalPackets = 0;
@@ -44,22 +43,15 @@ struct ReceiverState {
     std::atomic<uint32_t> finalTotalPackets{0};
 };
 
-static bool send_nack_packets(
-    int sockfd,
-    const std::vector<uint32_t>& missingPackets,
-    const sockaddr_in& clientAddress,
-    uint32_t chunkSize)
-{
-    constexpr size_t MAX_SEQS_PER_NACK = 256;
+static bool send_nack_packets(int sockfd, const std::vector<uint32_t>& missingPackets, const sockaddr_in& clientAddress, uint32_t chunkSize) {
+    size_t maxSeqsPerNack = std::max<size_t>(1, chunkSize / sizeof(uint32_t));
 
-    for (size_t i = 0; i < missingPackets.size(); i += MAX_SEQS_PER_NACK) {
+    for (size_t i = 0; i < missingPackets.size(); i += maxSeqsPerNack) {
         Packet nackPacket{};
         nackPacket.type = PACKET_NACK;
 
-        size_t count = std::min(MAX_SEQS_PER_NACK, missingPackets.size() - i);
-
+        size_t count = std::min(maxSeqsPerNack, missingPackets.size() - i);
         memcpy( nackPacket.data, missingPackets.data() + i, count * sizeof(uint32_t));
-
         nackPacket.data_length = static_cast<uint32_t>(count * sizeof(uint32_t));
 
         ssize_t bytesSent = sendto(
@@ -68,8 +60,7 @@ static bool send_nack_packets(
             packet_wire_size(nackPacket),
             0,
             reinterpret_cast<const sockaddr*>(&clientAddress),
-            sizeof(clientAddress)
-        );
+            sizeof(clientAddress) );
 
         if (bytesSent < 0) {
             perror("sendto NACK");
@@ -88,7 +79,7 @@ static void receiver_thread(ReceiverState& state, int threadIndex) {
         return;
     }
 
-int optval = 1;
+    int optval = 1;
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0) {
         perror("setsockopt(SO_REUSEPORT) failed");
         close(sockfd);
@@ -146,8 +137,8 @@ int optval = 1;
 
         // Start msg
         if (packet.type == PACKET_START) {
-            std::lock_guard<std::mutex> lock(state.fileMutex);
-            if (!state.receivingFile) {
+            std::lock_guard<std::mutex> lock(state.startMutex);
+            if (!state.ready.load(std::memory_order_relaxed)) {
                 std::cout << "[thread " << threadIndex << "] Received START packet." << std::endl;
                 
                 state.outputFilename = std::string (packet.data, packet.data_length);
@@ -157,37 +148,31 @@ int optval = 1;
                 state.chunkSize = std::min(std::max(packet.chunk_size, MIN_DATA_SIZE), MAX_DATA_SIZE);
 
                 state.fileBuffer.resize(state.fileSize);
-                state.received.assign(state.totalPackets, 0);
-
-                state.receivingFile = true;
+                state.receivedFlags = std::make_unique<std::atomic<bool>[]>(state.totalPackets);
+                for (uint32_t i = 0; i < state.totalPackets; ++i) {
+                    state.receivedFlags[i].store(false, std::memory_order_relaxed);
+                }
+                state.receivedCount.store(0, std::memory_order_relaxed);
 
                 std::cout << "[thread " << threadIndex << "] Prepared " << state.fileSize << " bytes in memory for " <<state.totalPackets << " packets." << std::endl;
+                state.ready.store(true, std::memory_order_release);
             }
-
         }
-        
         // paylaod msg 
         else if (packet.type == PACKET_DATA) {
-            std::lock_guard<std::mutex> lock(state.fileMutex);
-            
-            if (!state.receivingFile) {
+            if (!state.ready.load(std::memory_order_acquire)) {
                 std::cerr << "[thread " << threadIndex << "] Received DATA before START." << std::endl;
                 continue;
             }
-
             if (packet.sequence >= state.totalPackets) {
                 std::cerr << "[thread " << threadIndex << "] Invalid sequence: " << packet.sequence << std::endl;
                 continue;
             }
-
             if (packet.data_length > state.chunkSize) {
                 std::cerr << "[thread " << threadIndex << "] Invalid DATA length." << std::endl;
                 continue;
             }
-
-            // duplicate packet check
-            // if sequence number is already in the set, drop this copy and keep original
-            if (state.received[packet.sequence]) {
+            if (state.receivedFlags[packet.sequence].load(std::memory_order_relaxed)) {
                 continue;
             }
 
@@ -195,10 +180,12 @@ int optval = 1;
 
             std::memcpy(state.fileBuffer.data() + offset, packet.data, packet.data_length);
 
-            state.received[packet.sequence] = 1;
-
-            if (packet.sequence % 1000 == 0) {
-                std::cout << "[thread " << threadIndex << "] Received packet " << packet.sequence << " (" << packet.data_length << " bytes)" << std::endl;
+            bool expected = false;
+            if (state.receivedFlags[packet.sequence].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+                uint32_t received = state.receivedCount.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (packet.sequence % 1000 == 0) {
+                    std::cout << "[thread " << threadIndex << "] Received packet " << packet.sequence << " (" << packet.data_length << " bytes), " << received << " total." << std::endl;
+                }
             }
         }
         // end msg
@@ -220,7 +207,6 @@ int optval = 1;
 
     close(sockfd);
     std::cout << "[thread " << threadIndex << "] Closing connection." << std::endl;
-
 }
 
 int main() {
@@ -237,11 +223,15 @@ int main() {
         th.join();
     }
 
-    uint32_t totalPackets = state.finalTotalPackets.load();
+    uint32_t totalPackets = state.totalPackets != 0 ? state.totalPackets : state.finalTotalPackets.load();
+    uint32_t endReportedPackets = state.finalTotalPackets.load();
+    if (endReportedPackets != 0 && endReportedPackets != totalPackets) {
+        std::cerr << "Warning: END packet reported " << endReportedPackets << " total packets but START-derived count was " << totalPackets << std::endl;
+    }
 
     std::cout << "Expected DATA packets: " << totalPackets << std::endl;
 
-    if (!state.receivingFile) {
+    if (!state.ready.load()) {
         std::cerr << "No file transfer was started." << std::endl;
         return EXIT_FAILURE;
     }
@@ -252,13 +242,9 @@ int main() {
         std::lock_guard<std::mutex> lock(state.clientMutex);
 
         if (!state.clientAddressKnown) {
-            std::cerr
-                << "Cannot repair transfer: client address is unknown."
-                << std::endl;
-
+            std::cerr << "Cannot repair transfer: client address is unknown." << std::endl;
             return EXIT_FAILURE;
         }
-
         clientAddr = state.clientAddress;
     }
 
@@ -299,7 +285,7 @@ int main() {
 
         // Check the entire sequence range again
         for (uint32_t seq = 0; seq < totalPackets; ++seq) {
-            if (!state.received[seq]) {
+            if (!state.receivedFlags[seq].load(std::memory_order_relaxed)) {
                 missingPackets.push_back(seq);
             }
         }
@@ -307,7 +293,6 @@ int main() {
         uint32_t receivedPackets = totalPackets - static_cast<uint32_t>(missingPackets.size());
         std::cout << "Received DATA packets: " << receivedPackets << " / " << totalPackets << std::endl;
         std::cout << "Missing DATA packets: " << missingPackets.size() << std::endl;
-
 
         // Everything has arrived
         if (missingPackets.empty()) {
@@ -322,13 +307,7 @@ int main() {
                 break;
             }
 
-            size_t bytesWritten = fwrite(
-                state.fileBuffer.data(),
-                1,
-                state.fileSize,
-                outputFile
-            );
-
+            size_t bytesWritten = fwrite(state.fileBuffer.data(), 1, state.fileSize, outputFile);
             fclose(outputFile);
 
             auto writeCompleteTime = std::chrono::high_resolution_clock::now();
@@ -392,18 +371,15 @@ int main() {
             if (repairPacket.type != PACKET_DATA) {
                 continue;
             }
-
             if (repairPacket.sequence >= totalPackets) {
                 std::cerr << "Invalid retransmitted sequence: " << repairPacket.sequence << std::endl;
                 continue;
             }
-
             if (repairPacket.data_length > state.chunkSize) {
                 std::cerr << "Invalid retransmitted packet length." << std::endl;
                 continue;
             }
-
-            if (state.received[repairPacket.sequence]) {
+            if (state.receivedFlags[repairPacket.sequence].load(std::memory_order_relaxed)) {
                 continue;
             }
 
@@ -411,11 +387,13 @@ int main() {
 
             std::memcpy(state.fileBuffer.data() + offset, repairPacket.data, repairPacket.data_length);
 
-            state.received[repairPacket.sequence] = 1 ;
+            bool expected = false;
+            if (state.receivedFlags[repairPacket.sequence].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+                state.receivedCount.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 
     close(repairSock);
-
     return 0;
 }

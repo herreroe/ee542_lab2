@@ -1,17 +1,13 @@
 // Client side implementation of UDP client-server model - side that will be "sending" the file.
-// https://www.geeksforgeeks.org/cpp/udp-server-client-implementation-c/
-#include <bits/stdc++.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-
 #include <iostream>
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
-
 #include <thread>
 #include <vector>
 #include <mutex>
@@ -21,17 +17,11 @@
 #include "zap_protocol.hpp"
 #include "zap_cli.hpp"
 
-
 static std::mutex g_coutMutex;
+constexpr double TOTAL_TARGET_BPS = 60.0 * 1000.0 * 1000.0;
 
-static bool send_chunk(const std::string& filename,
-                        const std::string& serverIP,
-                        int port,
-                        uint64_t startOffset,
-                        uint64_t endOffset,
-                        uint32_t startSeq,
-                        int threadIndex,
-                        uint32_t chunkSize) {
+static bool send_chunk(const std::string& filename, const std::string& serverIP, int port, uint64_t startOffset, uint64_t endOffset,
+                            uint32_t startSeq, int threadIndex, uint32_t chunkSize) {
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("socket creation failed (thread)");
@@ -53,6 +43,9 @@ static bool send_chunk(const std::string& filename,
         return false;
     }
 
+    int sndbuf = 32 * 1024 * 1024; //replicating  increase on client
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
     std::ifstream file(filename, std::ios::binary);
 
     if (!file.is_open()) {
@@ -64,6 +57,11 @@ static bool send_chunk(const std::string& filename,
 
     uint32_t sequence = startSeq;
     uint64_t bytesRemaining = endOffset - startOffset;
+
+    const double thread_target_bps = TOTAL_TARGET_BPS / static_cast<double>(NUM_THREADS);
+    const double bits_per_packet = static_cast<double>(chunkSize) * 8.0;
+    const auto packet_interval = std::chrono::microseconds(static_cast<long long>((bits_per_packet / thread_target_bps) * 1e6));
+    std::this_thread::sleep_for(packet_interval * threadIndex / NUM_THREADS);
 
     while (bytesRemaining > 0) {
         Packet dataPacket{};
@@ -79,13 +77,10 @@ static bool send_chunk(const std::string& filename,
 
         ssize_t bytesSent = send(sockfd, &dataPacket, packet_wire_size(dataPacket), 0);
         if (bytesSent < 0) {
-            perror("send (thread)");
-            break;
+            perror("send (thread), skipping this packet");
         }
-        if (chunkSize > 1500) {
-            std::this_thread::sleep_for(
-                std::chrono::microseconds(1500)
-            );
+        if (packet_interval.count() > 0) {
+            std::this_thread::sleep_for(packet_interval);
         }
 
         bytesRemaining -= static_cast<uint64_t>(bytesRead);
@@ -101,19 +96,8 @@ static bool send_chunk(const std::string& filename,
     return true;
 }
 
-// TODO: 
-// notes: we should probs move the packet_start outside so that it must send an ack to confirm file can be sent. 
-// Then while loop for as long as it takes to recv all of the packets. then send an fin message - might be able to do away with the 
-// "PACKET_END" as in once all of the data from the file is sent and acked fully/
-// PACKET_START will likely need to specify how large the size of the file to be sent is - so the receiver can know how many packets to expect,etc
 
-static bool resend_packet(
-    int sockfd,
-    const std::string& filePath,
-    uint32_t sequence,
-    uint64_t fileSize,
-    uint32_t chunkSize)
-{
+static bool resend_packet(int sockfd, const std::string& filePath, uint32_t sequence, uint64_t fileSize, uint32_t chunkSize) {
     std::ifstream file(filePath, std::ios::binary);
 
     if (!file.is_open()) {
@@ -121,8 +105,7 @@ static bool resend_packet(
         return false;
     }
 
-    uint64_t offset =
-        static_cast<uint64_t>(sequence) * chunkSize;
+    uint64_t offset = static_cast<uint64_t>(sequence) * chunkSize;
 
     if (offset >= fileSize) {
         std::cerr << "Invalid retransmission sequence: " << sequence << std::endl;
@@ -198,12 +181,8 @@ int main(int argc, char* argv[]) {
 
     // checkk server addr
     if (inet_pton(AF_INET, serverIP,  &servaddr.sin_addr ) <= 0) {
-        std::cerr
-            << "Invalid server IP address: "
-            << serverIP
-            << std::endl;
+        std::cerr << "Invalid server IP address: " << serverIP << std::endl;
         close(sockfd);
-
         return EXIT_FAILURE;
     }
 
@@ -216,7 +195,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "UDP socket connected to " << serverIP << ":" << args.port << std::endl;
     uint32_t chunkSize = detect_payload_size(sockfd);
-    std::cout << "Negotiated payload size: " << chunkSize << " bytes/packet (based on path MTU)." << std::endl;
+    std::cout << "Payload size: " << chunkSize << " bytes/packet (based on path MTU)." << std::endl;
 
     uint32_t totalPackets = static_cast<uint32_t>((fileSize + chunkSize - 1) / chunkSize);
 
@@ -303,49 +282,32 @@ int main(int argc, char* argv[]) {
     }
     
     if (!endSendFailed) {
-        std::cout << "END packet sent 5 times." << std::endl;
+        std::cout << "END packet sent times." << std::endl;
     }
     struct timeval controlTimeout{};
     controlTimeout.tv_sec = 3;
     controlTimeout.tv_usec = 0;
 
-    if (setsockopt(
-            sockfd,
-            SOL_SOCKET,
-            SO_RCVTIMEO,
-            &controlTimeout,
-            sizeof(controlTimeout)
-        ) < 0) {
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &controlTimeout, sizeof(controlTimeout)) < 0) {
         perror("setsockopt(SO_RCVTIMEO)");
     }
     std::cout << "Waiting for NACK or COMPLETE..." << std::endl;
 
     while (true) {
         Packet response{};
-
         ssize_t n = recv( sockfd, &response, sizeof(response), 0);
 
         if (n < 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                std::cerr
-                    << "Control receive timeout. Resending END..."
-                    << std::endl;
-
-                ssize_t resendEnd = send(
-                    sockfd,
-                    &endPacket,
-                    packet_wire_size(endPacket),
-                    0
-                );
+                std::cerr << "Control receive timeout. Resending END..." << std::endl;
+                ssize_t resendEnd = send(sockfd, &endPacket, packet_wire_size(endPacket), 0);
 
                 if (resendEnd < 0) {
                     perror("resend END");
                     break;
                 }
-
                 continue;
             }
-
             perror("recv control packet");
             break;
         }
@@ -357,21 +319,33 @@ int main(int argc, char* argv[]) {
             }
 
             size_t count = response.data_length / sizeof(uint32_t);
-
             std::vector<uint32_t> missingSequences(count);
 
             memcpy(missingSequences.data(), response.data, response.data_length);
 
             std::cout << "Received NACK for " << count << " packets." << std::endl;
 
+            const double bits_per_packet = static_cast<double>(chunkSize) * 8.0;
+            const auto retransmit_interval = std::chrono::microseconds(static_cast<long long>((bits_per_packet / TOTAL_TARGET_BPS) * 1e6));
+
             for (uint32_t seq : missingSequences) {
                 retransmitCount++;
                 resend_packet(sockfd, args.file_path, seq, fileSize, chunkSize); // send retransmissions
+                if (retransmit_interval.count() > 0) {
+                    std::this_thread::sleep_for(retransmit_interval);
+                }
             }
         }
         else if (response.type == PACKET_COMPLETE) {
+            auto transferEndTime = std::chrono::high_resolution_clock::now();
+            double elapsedSeconds = std::chrono::duration<double>(transferEndTime - firstBitSentTime).count();
+            double throughputMbps = elapsedSeconds > 0.0
+                ? (static_cast<double>(fileSize) * 8.0) / elapsedSeconds / 1e6
+                : 0.0;
+
             std::cout << "Timestamp (First bit sent): " << duration_us << " us (epoch)" << std::endl;
             std::cout << "Retransmitted: " << retransmitCount << " packets." << std::endl;
+            std::cout << "Elapsed (client clock, START sent -> COMPLETE received): " << elapsedSeconds << " s, " << throughputMbps << " Mbps" << std::endl;
             std::cout << "Server confirmed file transfer complete." << std::endl;
             break;
         }
