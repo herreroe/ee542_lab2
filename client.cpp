@@ -18,7 +18,7 @@
 #include "zap_cli.hpp"
 
 static std::mutex g_coutMutex;
-constexpr double TOTAL_TARGET_BPS = 60.0 * 1000.0 * 1000.0;
+constexpr double TOTAL_TARGET_BPS = 100.0 * 1000.0 * 1000.0;
 
 static bool send_chunk(const std::string& filename, const std::string& serverIP, int port, uint64_t startOffset, uint64_t endOffset,
                             uint32_t startSeq, int threadIndex, uint32_t chunkSize) {
@@ -80,7 +80,8 @@ static bool send_chunk(const std::string& filename, const std::string& serverIP,
             perror("send (thread), skipping this packet");
         }
         if (packet_interval.count() > 0) {
-            std::this_thread::sleep_for(packet_interval);
+             std::this_thread::sleep_for(packet_interval);
+
         }
 
         bytesRemaining -= static_cast<uint64_t>(bytesRead);
@@ -337,11 +338,10 @@ int main(int argc, char* argv[]) {
             }
         }
         else if (response.type == PACKET_COMPLETE) {
-            auto transferEndTime = std::chrono::high_resolution_clock::now();
-            double elapsedSeconds = std::chrono::duration<double>(transferEndTime - firstBitSentTime).count();
-            double throughputMbps = elapsedSeconds > 0.0
-                ? (static_cast<double>(fileSize) * 8.0) / elapsedSeconds / 1e6
-                : 0.0;
+            auto transferEndClock = std::chrono::high_resolution_clock::now();
+            auto transferEndTime = std::chrono::duration_cast<std::chrono::microseconds>(transferEndClock.time_since_epoch()).count();
+            double elapsedSeconds = static_cast<double>(transferEndTime - duration_us) / 1e6;
+            double throughputMbps = (static_cast<double>(fileSize) * 8.0) / elapsedSeconds / 1e6;
 
             std::cout << "Timestamp (First bit sent): " << duration_us << " us (epoch)" << std::endl;
             std::cout << "Retransmitted: " << retransmitCount << " packets." << std::endl;
