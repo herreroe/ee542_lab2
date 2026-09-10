@@ -18,7 +18,7 @@
 #include "zap_cli.hpp"
 
 static std::mutex g_coutMutex;
-constexpr double TOTAL_TARGET_BPS = 100.0 * 1000.0 * 1000.0;
+// constexpr double TOTAL_TARGET_BPS = 100.0 * 1000.0 * 1000.0;
 
 static bool send_chunk(const std::string& filename, const std::string& serverIP, int port, uint64_t startOffset, uint64_t endOffset,
                             uint32_t startSeq, int threadIndex, uint32_t chunkSize) {
@@ -58,10 +58,10 @@ static bool send_chunk(const std::string& filename, const std::string& serverIP,
     uint32_t sequence = startSeq;
     uint64_t bytesRemaining = endOffset - startOffset;
 
-    const double thread_target_bps = TOTAL_TARGET_BPS / static_cast<double>(NUM_THREADS);
-    const double bits_per_packet = static_cast<double>(chunkSize) * 8.0;
-    const auto packet_interval = std::chrono::microseconds(static_cast<long long>((bits_per_packet / thread_target_bps) * 1e6));
-    std::this_thread::sleep_for(packet_interval * threadIndex / NUM_THREADS);
+    // const double thread_target_bps = TOTAL_TARGET_BPS / static_cast<double>(NUM_THREADS);
+    // const double bits_per_packet = static_cast<double>(chunkSize) * 8.0;
+    // const auto packet_interval = std::chrono::microseconds(static_cast<long long>((bits_per_packet / thread_target_bps) * 1e6));
+    // std::this_thread::sleep_for(packet_interval * threadIndex / NUM_THREADS);
 
     while (bytesRemaining > 0) {
         Packet dataPacket{};
@@ -79,9 +79,8 @@ static bool send_chunk(const std::string& filename, const std::string& serverIP,
         if (bytesSent < 0) {
             perror("send (thread), skipping this packet");
         }
-        if (packet_interval.count() > 0) {
-             std::this_thread::sleep_for(packet_interval);
-
+        if (chunkSize > 256) {
+             std::this_thread::sleep_for(std::chrono::microseconds(chunkSize));
         }
 
         bytesRemaining -= static_cast<uint64_t>(bytesRead);
@@ -326,14 +325,14 @@ int main(int argc, char* argv[]) {
 
             std::cout << "Received NACK for " << count << " packets." << std::endl;
 
-            const double bits_per_packet = static_cast<double>(chunkSize) * 8.0;
-            const auto retransmit_interval = std::chrono::microseconds(static_cast<long long>((bits_per_packet / TOTAL_TARGET_BPS) * 1e6));
+            // const double bits_per_packet = static_cast<double>(chunkSize) * 8.0;
+            // const auto retransmit_interval = std::chrono::microseconds(static_cast<long long>((bits_per_packet / TOTAL_TARGET_BPS) * 1e6));
 
             for (uint32_t seq : missingSequences) {
                 retransmitCount++;
                 resend_packet(sockfd, args.file_path, seq, fileSize, chunkSize); // send retransmissions
-                if (retransmit_interval.count() > 0) {
-                    std::this_thread::sleep_for(retransmit_interval);
+                if (chunkSize > 256) {
+                     std::this_thread::sleep_for(std::chrono::microseconds(chunkSize));
                 }
             }
         }
