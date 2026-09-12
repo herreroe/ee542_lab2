@@ -351,17 +351,12 @@ int main() {
             Packet completePacket{};
             completePacket.type = PACKET_COMPLETE;
             completePacket.data_length = 0;
+            ssize_t bytesSent;
 
-            ssize_t bytesSent = sendto(
-                sockfd,
-                &completePacket,
-                packet_wire_size(completePacket),
-                0,
-                reinterpret_cast<const sockaddr*>(
-                    &state.clientAddress
-                ),
-                sizeof(state.clientAddress)
-            );
+            for (int i = 0; i < 5; ++i) {
+                bytesSent = sendto(sockfd, &completePacket, packet_wire_size(completePacket),
+                        0, reinterpret_cast<const sockaddr*>( &state.clientAddress), sizeof(state.clientAddress));
+            }
 
             if (bytesSent < 0) {
                 perror("sendto COMPLETE");
