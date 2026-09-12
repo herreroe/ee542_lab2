@@ -328,17 +328,15 @@ int main() {
             }
 
             size_t bytesWritten = fwrite(state.fileBuffer.get(), 1, state.fileSize, outputFile);
-            fclose(outputFile);
 
             if (bytesWritten != state.fileSize) {
                 std::cerr << "Failed to write complete file." << std::endl;
                 std::cerr << "Expected: " << state.fileSize << " bytes" << std::endl;
-                std::cerr << "Written:  " << bytesWritten << " bytes" << std::endl;
+                std::cerr << "Written: " << bytesWritten << " bytes" << std::endl;
 
                 if (ferror(outputFile)) {
                     perror("fwrite");
                 }
-
                 fclose(outputFile);
                 break;
             }

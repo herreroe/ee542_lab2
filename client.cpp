@@ -87,14 +87,7 @@ static bool send_chunk(const std::string& filename, const std::string& serverIP,
 }
 
 
-static bool resend_packet(int sockfd, const std::string& filePath, uint32_t sequence, uint64_t fileSize, uint32_t chunkSize) {
-    std::ifstream file(filePath, std::ios::binary);
-
-    if (!file.is_open()) {
-        std::cerr << "Failed to open file for retransmission." << std::endl;
-        return false;
-    }
-
+static bool resend_packet(int sockfd, std::ifstream& file, uint32_t sequence, uint64_t fileSize, uint32_t chunkSize) {
     uint64_t offset = static_cast<uint64_t>(sequence) * chunkSize;
 
     if (offset >= fileSize) {
@@ -102,7 +95,9 @@ static bool resend_packet(int sockfd, const std::string& filePath, uint32_t sequ
         return false;
     }
 
-    file.seekg(offset);
+    // Reuse the already-open file instead of opening/closing it for every retransmission.
+    file.clear();
+    file.seekg(static_cast<std::streamoff>(offset));
 
     uint64_t remaining = fileSize - offset;
     uint32_t bytesToRead = static_cast<uint32_t>( std::min<uint64_t>(chunkSize, remaining));
@@ -162,6 +157,11 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "UDP socket created."  << std::endl;
+
+    int rcvbuf = 32 * 1024 * 1024;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        perror("setsockopt(SO_RCVBUF)");
+    }
 
     memset(&servaddr, 0, sizeof(servaddr));
 
@@ -303,16 +303,59 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
+            // Collect NACK packets before retransmit
+            std::vector<uint32_t> missingSequences;
+
             size_t count = response.data_length / sizeof(uint32_t);
-            std::vector<uint32_t> missingSequences(count);
+            size_t oldSize = missingSequences.size();
+            missingSequences.resize(oldSize + count);
+            memcpy(missingSequences.data() + oldSize, response.data, response.data_length);
 
-            memcpy(missingSequences.data(), response.data, response.data_length);
+            struct timeval nackTimeout{};
+            nackTimeout.tv_sec = 0;
+            nackTimeout.tv_usec = 50000;
 
-            std::cout << "Received NACK for " << count << " packets." << std::endl;
+            if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &nackTimeout, sizeof(nackTimeout)) < 0) {
+                perror("setsockopt(NACK timeout)");
+            }
+
+            while (true) {
+                Packet moreNacks{};
+                ssize_t more = recv(sockfd, &moreNacks, sizeof(moreNacks), 0);
+
+                if (more < 0) {
+                    if (errno == EWOULDBLOCK || errno == EAGAIN) {break;}
+                    perror("recv additional NACK");
+                    break;
+                }
+                if (moreNacks.type != PACKET_NACK) {
+                    continue;
+                }
+
+                if (moreNacks.data_length > MAX_DATA_SIZE || moreNacks.data_length % sizeof(uint32_t) != 0) {
+                    std::cerr << "Invalid NACK packet." << std::endl;
+                    continue;
+                }
+                size_t moreCount = moreNacks.data_length / sizeof(uint32_t);
+                size_t previousSize = missingSequences.size();
+                missingSequences.resize(previousSize + moreCount);
+                memcpy(missingSequences.data() + previousSize, moreNacks.data, moreNacks.data_length);
+            }
+            // Restore normal timeout
+            if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &controlTimeout, sizeof(controlTimeout)) < 0) {
+                perror("setsockopt(SO_RCVTIMEO)");
+            }
+
+            // handle sequence num duplicates
+            std::sort(missingSequences.begin(), missingSequences.end());
+            missingSequences.erase(std::unique(missingSequences.begin(), missingSequences.end()), missingSequences.end());
+
+            std::cout << "Collected NACKs for " << missingSequences.size() << " packets." << std::endl;
 
             for (uint32_t seq : missingSequences) {
-                retransmitCount++;
-                resend_packet(sockfd, args.file_path, seq, fileSize, chunkSize); // send retransmissions
+                if (resend_packet(sockfd, inputFile, seq, fileSize, chunkSize)) {
+                    retransmitCount++;
+                }
             }
         }
         else if (response.type == PACKET_COMPLETE) {
