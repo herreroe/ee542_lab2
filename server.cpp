@@ -183,9 +183,6 @@ static void receiver_thread(ReceiverState& state, int threadIndex) {
             bool expected = false;
             if (state.receivedFlags[packet.sequence].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
                 uint32_t received = state.receivedCount.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (packet.sequence % 1000 == 0) {
-                    std::cout << "[thread " << threadIndex << "] Received packet " << packet.sequence << " (" << packet.data_length << " bytes), " << received << " total." << std::endl;
-                }
             }
         }
         // end msg
