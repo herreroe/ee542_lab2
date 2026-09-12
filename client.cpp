@@ -194,10 +194,8 @@ int main(int argc, char* argv[]) {
     uint32_t totalPackets = static_cast<uint32_t>((fileSize + chunkSize - 1) / chunkSize);
 
     Packet packet{};
-
     packet.type = PACKET_START;
     packet.sequence = 0;
-
     packet.file_size = fileSize;
     packet.total_packets = totalPackets;
     packet.chunk_size = chunkSize;
@@ -225,10 +223,8 @@ int main(int argc, char* argv[]) {
 
     std::cout << "START packet sent." << std::endl;
 
-
     // send file 
     uint32_t packetsPerThread = (totalPackets + NUM_THREADS - 1) / NUM_THREADS;
-
     std::vector<std::thread> threads;
     for (int t = 0; t < NUM_THREADS; t++) {
         uint32_t startSeq = static_cast<uint32_t>(t) * packetsPerThread;
@@ -241,7 +237,6 @@ int main(int argc, char* argv[]) {
     threads.emplace_back(send_chunk, filename, args.ip_address, args.port, startOffset, endOffset, startSeq, t, chunkSize);
 
     }
-
     for (auto& th : threads) {
         th.join();
     }
@@ -318,9 +313,6 @@ int main(int argc, char* argv[]) {
             memcpy(missingSequences.data(), response.data, response.data_length);
 
             std::cout << "Received NACK for " << count << " packets." << std::endl;
-
-            // const double bits_per_packet = static_cast<double>(chunkSize) * 8.0;
-            // const auto retransmit_interval = std::chrono::microseconds(static_cast<long long>((bits_per_packet / TOTAL_TARGET_BPS) * 1e6));
 
             for (uint32_t seq : missingSequences) {
                 retransmitCount++;

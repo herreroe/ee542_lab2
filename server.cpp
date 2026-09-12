@@ -1,47 +1,145 @@
-// Server side implementation of UDP client-server model - side that will be "receiving" the file
+// Server side implementation of UDP client-server model - optimized but kept simple
 
-#include <stdlib.h> 
-#include <unistd.h> 
-#include <string.h> 
-#include <sys/types.h> 
-#include <sys/socket.h> 
-#include <arpa/inet.h> 
-#include <netinet/in.h> 
-  
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include <iostream>
-#include <fstream>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <thread>
 #include <vector>
 #include <memory>
-#include <mutex>
 #include <atomic>
+#include <chrono>
+#include <new>
+#include <algorithm>
+#include <cerrno>
 
 #include "zap_protocol.hpp"
 
-
 struct ReceiverState {
-    std::mutex startMutex;
-    std::atomic<bool> ready{false};
-
     std::string outputFilename;
 
-    std::vector<char> fileBuffer;
+    std::unique_ptr<char[]> fileBuffer;
     std::unique_ptr<std::atomic<bool>[]> receivedFlags;
     std::atomic<uint32_t> receivedCount{0};
 
     uint64_t fileSize = 0;
     uint32_t totalPackets = 0;
     uint32_t chunkSize = 0;
-    
-    std::mutex clientMutex;
+
     sockaddr_in clientAddress{};
-    bool clientAddressKnown = false;
 
     std::atomic<bool> stopRequested{false};
-    std::atomic<uint32_t> finalTotalPackets{0};
+    std::atomic<long long> finalRecvTimeUs{0};
 };
+
+static long long current_time_us() {
+    auto now = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        now.time_since_epoch()
+    ).count();
+}
+
+static bool process_data_packet(ReceiverState& state, const Packet& packet) {
+    if (packet.sequence >= state.totalPackets) {
+        return false;
+    }
+
+    if (packet.data_length > state.chunkSize) {
+        return false;
+    }
+
+    uint64_t offset = static_cast<uint64_t>(packet.sequence) * state.chunkSize;
+
+    if (offset + packet.data_length > state.fileSize) {
+        return false;
+    }
+
+    bool expected = false;
+
+    // Only one thread is allowed to process this sequence number.
+    if (!state.receivedFlags[packet.sequence].compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_relaxed)) {
+        return true; // duplicate packet
+    }
+
+    std::memcpy( state.fileBuffer.get() + offset, packet.data, packet.data_length);
+    uint32_t received = state.receivedCount.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // Record the exact time the last required DATA packet is copied.
+    if (received == state.totalPackets) {
+        state.finalRecvTimeUs.store( current_time_us(), std::memory_order_relaxed);
+    }
+
+    return true;
+}
+
+static void receiver_thread(int sockfd, ReceiverState& state, int threadIndex) {
+    Packet packet{};
+    int timeoutsAfterEnd = 0;
+
+    while (true) {
+        ssize_t n = recvfrom(
+            sockfd,
+            &packet,
+            sizeof(packet),
+            0,
+            nullptr,
+            nullptr
+        );
+
+        if (n < 0) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                if (state.stopRequested.load(std::memory_order_relaxed)) {
+                    timeoutsAfterEnd++;
+
+                    if (timeoutsAfterEnd >= 2) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            perror("recvfrom");
+            break;
+        }
+
+        timeoutsAfterEnd = 0;
+
+        if (static_cast<size_t>(n) < PACKET_HEADER_SIZE) {
+            continue;
+        }
+
+        if (packet.data_length > MAX_DATA_SIZE) {
+            continue;
+        }
+
+        if (static_cast<size_t>(n) <
+            PACKET_HEADER_SIZE + packet.data_length) {
+            continue;
+        }
+
+        if (packet.type == PACKET_DATA) {
+            process_data_packet(state, packet);
+        }
+        else if (packet.type == PACKET_END) {
+            state.stopRequested.store(true, std::memory_order_relaxed);
+        }
+        else if (packet.type == PACKET_START) {
+            // Ignore duplicate START packets.
+        }
+    }
+
+    std::cout << "[thread " << threadIndex << "] receiver finished." << std::endl;
+}
 
 static bool send_nack_packets(int sockfd, const std::vector<uint32_t>& missingPackets, const sockaddr_in& clientAddress, uint32_t chunkSize) {
     size_t maxSeqsPerNack = std::max<size_t>(1, chunkSize / sizeof(uint32_t));
@@ -51,7 +149,8 @@ static bool send_nack_packets(int sockfd, const std::vector<uint32_t>& missingPa
         nackPacket.type = PACKET_NACK;
 
         size_t count = std::min(maxSeqsPerNack, missingPackets.size() - i);
-        memcpy( nackPacket.data, missingPackets.data() + i, count * sizeof(uint32_t));
+
+        std::memcpy(nackPacket.data, missingPackets.data() + i, count * sizeof(uint32_t));
         nackPacket.data_length = static_cast<uint32_t>(count * sizeof(uint32_t));
 
         ssize_t bytesSent = sendto(
@@ -60,246 +159,181 @@ static bool send_nack_packets(int sockfd, const std::vector<uint32_t>& missingPa
             packet_wire_size(nackPacket),
             0,
             reinterpret_cast<const sockaddr*>(&clientAddress),
-            sizeof(clientAddress) );
+            sizeof(clientAddress)
+        );
 
         if (bytesSent < 0) {
             perror("sendto NACK");
             return false;
         }
-        std::cout << "Sent NACK for " << count << " missing packets." << std::endl;
     }
 
     return true;
 }
 
-static void receiver_thread(ReceiverState& state, int threadIndex) {
+int main() {
+    ReceiverState state;
+
+    // Create ONE UDP socket.
+    // Both receiver threads will read from this same socket.
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
     if (sockfd < 0) {
-        perror("socket creation failed (receiver thread)");
-        return;
+        perror("socket creation failed");
+        return EXIT_FAILURE;
     }
 
-    int optval = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0) {
-        perror("setsockopt(SO_REUSEPORT) failed");
-        close(sockfd);
-        return;
-    }
-
-    // added bc no flow control or ACKs yet
+    // Give the kernel more room to hold incoming UDP packets.
     int rcvbuf = 32 * 1024 * 1024;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-  
-    struct sockaddr_in servaddr{};
+
+    if (setsockopt(
+            sockfd,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &rcvbuf,
+            sizeof(rcvbuf)) < 0) {
+        perror("setsockopt(SO_RCVBUF)");
+    }
+
+    sockaddr_in servaddr{};
     servaddr.sin_family = AF_INET;
     servaddr.sin_addr.s_addr = INADDR_ANY;
     servaddr.sin_port = htons(SERVER_PORT);
 
-    if (bind(sockfd, reinterpret_cast<sockaddr*>(&servaddr), sizeof(servaddr)) < 0) {
-        perror("bind failed (receiver thread)");
+    if (bind( sockfd, reinterpret_cast<sockaddr*>(&servaddr), sizeof(servaddr)) < 0) {
+        perror("bind failed");
         close(sockfd);
-        return;
+        return EXIT_FAILURE;
     }
 
-    struct timeval timeout{};
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 200000; // 200ms
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        
-    Packet packet{};
+    std::cout << "Server waiting for START packet on port " << SERVER_PORT << "..." << std::endl;
+
+    // Receive START BEFORE launching the receiver threads.
+    //
+    // This prevents DATA from being discarded while the 1 GB file
+    // buffer and packet flags are being prepared.
+    Packet startPacket{};
     sockaddr_in clientAddress{};
     socklen_t clientAddressLength = sizeof(clientAddress);
-    int consecutiveTimeoutsAfterStop = 0;
-    
-    while (true)
-    {
+
+    while (true) {
         ssize_t n = recvfrom(
             sockfd,
-            &packet,
-            sizeof(packet),
+            &startPacket,
+            sizeof(startPacket),
             0,
             reinterpret_cast<sockaddr*>(&clientAddress),
             &clientAddressLength
         );
 
-
         if (n < 0) {
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                if (state.stopRequested.load()) {
-                    if(++consecutiveTimeoutsAfterStop >= 2) break;
-                }
-                continue;
-            }
-            perror("recvfrom");
-            break;
-        }
-        consecutiveTimeoutsAfterStop = 0;
-
-        // Start msg
-        if (packet.type == PACKET_START) {
-            std::lock_guard<std::mutex> lock(state.startMutex);
-            if (!state.ready.load(std::memory_order_relaxed)) {
-                std::cout << "[thread " << threadIndex << "] Received START packet." << std::endl;
-                
-                state.outputFilename = std::string (packet.data, packet.data_length);
-
-                state.fileSize = packet.file_size;
-                state.totalPackets = packet.total_packets;
-                state.chunkSize = std::min(std::max(packet.chunk_size, MIN_DATA_SIZE), MAX_DATA_SIZE);
-
-                state.fileBuffer.resize(state.fileSize);
-                state.receivedFlags = std::make_unique<std::atomic<bool>[]>(state.totalPackets);
-                for (uint32_t i = 0; i < state.totalPackets; ++i) {
-                    state.receivedFlags[i].store(false, std::memory_order_relaxed);
-                }
-                state.receivedCount.store(0, std::memory_order_relaxed);
-
-                std::cout << "[thread " << threadIndex << "] Prepared " << state.fileSize << " bytes in memory for " <<state.totalPackets << " packets." << std::endl;
-                state.ready.store(true, std::memory_order_release);
-            }
-        }
-        // paylaod msg 
-        else if (packet.type == PACKET_DATA) {
-            if (!state.ready.load(std::memory_order_acquire)) {
-                std::cerr << "[thread " << threadIndex << "] Received DATA before START." << std::endl;
-                continue;
-            }
-            if (packet.sequence >= state.totalPackets) {
-                std::cerr << "[thread " << threadIndex << "] Invalid sequence: " << packet.sequence << std::endl;
-                continue;
-            }
-            if (packet.data_length > state.chunkSize) {
-                std::cerr << "[thread " << threadIndex << "] Invalid DATA length." << std::endl;
-                continue;
-            }
-            if (state.receivedFlags[packet.sequence].load(std::memory_order_relaxed)) {
-                continue;
-            }
-
-            uint64_t offset = static_cast<uint64_t>(packet.sequence) * state.chunkSize;
-
-            std::memcpy(state.fileBuffer.data() + offset, packet.data, packet.data_length);
-
-            bool expected = false;
-            if (state.receivedFlags[packet.sequence].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
-                uint32_t received = state.receivedCount.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (packet.sequence % 1000 == 0) {
-                    std::cout << "[thread " << threadIndex << "] Received packet " << packet.sequence << " (" << packet.data_length << " bytes), " << received << " total." << std::endl;
-                }
-            }
-        }
-        // end msg
-        else if (packet.type == PACKET_END) {
-            std::cout << "[thread " << threadIndex << "] Received END packet." << std::endl;
-            {
-                std::lock_guard<std::mutex> lock(state.clientMutex);
-                state.clientAddress = clientAddress;
-                state.clientAddressKnown = true;
-            }
-
-            state.finalTotalPackets.store(packet.sequence);
-            state.stopRequested.store(true);
-        }
-        else {
-            std::cerr << "[thread " << threadIndex << "] Unknown packet type: " << packet.type << std::endl;
-        }
-    }
-
-    close(sockfd);
-    std::cout << "[thread " << threadIndex << "] Closing connection." << std::endl;
-}
-
-int main() {
-    std::cout << "Starting " << NUM_THREADS << " receiver threads, each bound to UDP port " << SERVER_PORT << " via SO_REUSEPORT." << std::endl;
-
-    ReceiverState state;
-    std::vector<std::thread> threads;
-    threads.reserve(NUM_THREADS);
-    for (int t = 0; t < NUM_THREADS; t++) {
-        threads.emplace_back(receiver_thread, std::ref(state), t);
-    }
-
-    for (auto& th : threads) {
-        th.join();
-    }
-
-    uint32_t totalPackets = state.totalPackets != 0 ? state.totalPackets : state.finalTotalPackets.load();
-    uint32_t endReportedPackets = state.finalTotalPackets.load();
-    if (endReportedPackets != 0 && endReportedPackets != totalPackets) {
-        std::cerr << "Warning: END packet reported " << endReportedPackets << " total packets but START-derived count was " << totalPackets << std::endl;
-    }
-
-    std::cout << "Expected DATA packets: " << totalPackets << std::endl;
-
-    if (!state.ready.load()) {
-        std::cerr << "No file transfer was started." << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    sockaddr_in clientAddr{};
-
-    {
-        std::lock_guard<std::mutex> lock(state.clientMutex);
-
-        if (!state.clientAddressKnown) {
-            std::cerr << "Cannot repair transfer: client address is unknown." << std::endl;
+            perror("recvfrom START");
+            close(sockfd);
             return EXIT_FAILURE;
         }
-        clientAddr = state.clientAddress;
+
+        if (static_cast<size_t>(n) < PACKET_HEADER_SIZE) {
+            continue;
+        }
+
+        if (startPacket.type != PACKET_START) {
+            continue;
+        }
+
+        if (startPacket.data_length == 0 ||
+            startPacket.data_length >= FILENAME_SIZE ||
+            startPacket.data_length > MAX_DATA_SIZE) {
+
+            std::cerr << "Invalid START packet." << std::endl;
+            continue;
+        }
+
+        break;
     }
 
-    // Create one socket for the repair phase.
-    // This socket sends NACKs and receives retransmitted DATA.
-    int repairSock = socket(AF_INET, SOCK_DGRAM, 0);
+    state.outputFilename = std::string(
+        startPacket.data,
+        startPacket.data_length
+    );
 
-    if (repairSock < 0) {
-        perror("socket creation failed (repair)");
+    state.fileSize = startPacket.file_size;
+    state.totalPackets = startPacket.total_packets;
+    state.chunkSize = std::min(
+        std::max(startPacket.chunk_size, MIN_DATA_SIZE),
+        MAX_DATA_SIZE
+    );
+
+    state.clientAddress = clientAddress;
+
+    if (state.fileSize == 0 || state.totalPackets == 0) {
+        std::cerr << "Invalid file information in START packet."
+                  << std::endl;
+        close(sockfd);
         return EXIT_FAILURE;
     }
 
-    sockaddr_in repairAddress{};
-    repairAddress.sin_family = AF_INET;
-    repairAddress.sin_addr.s_addr = INADDR_ANY;
-    repairAddress.sin_port = htons(SERVER_PORT);
+    state.fileBuffer.reset( new (std::nothrow) char[state.fileSize]);
 
-    if (bind( repairSock, reinterpret_cast<sockaddr*>(&repairAddress), sizeof(repairAddress)) < 0) {
-        perror("bind failed (repair)");
-        close(repairSock);
+    if (!state.fileBuffer) {
+        std::cerr << "Could not allocate file buffer." << std::endl;
+        close(sockfd);
         return EXIT_FAILURE;
     }
 
-    // Larger buffer for retransmitted packets
-    int rcvbuf = 32 * 1024 * 1024;
-    setsockopt(repairSock, SOL_SOCKET, SO_RCVBUF,  &rcvbuf, sizeof(rcvbuf));
+    state.receivedFlags =  std::make_unique<std::atomic<bool>[]>(state.totalPackets);
 
-    // After 500 ms without another repair packet,
-    // check the whole file again.
-    struct timeval timeout{};
+    for (uint32_t i = 0; i < state.totalPackets; i++) {
+        state.receivedFlags[i].store(false, std::memory_order_relaxed);
+    }
+
+    std::cout << "Receiving " << state.fileSize<< " bytes in " << state.totalPackets << " packets using " << NUM_THREADS << " receiver threads." << std::endl;
+
+    // Timeout allows threads to stop shortly after END.
+    timeval timeout{};
     timeout.tv_sec = 0;
-    timeout.tv_usec = 500000;
+    timeout.tv_usec = 200000;
 
-    setsockopt(repairSock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt(SO_RCVTIMEO)");
+    }
 
+    // Multiple threads read from the SAME socket.
+    // Linux gives each UDP datagram to one waiting thread.
+    std::vector<std::thread> threads;
+    threads.reserve(NUM_THREADS);
+
+    for (int t = 0; t < NUM_THREADS; t++) {
+        threads.emplace_back(receiver_thread, sockfd, std::ref(state), t);
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    std::cout << "Initial receive finished." << std::endl;
+
+    // Repair phase.
     while (true) {
         std::vector<uint32_t> missingPackets;
 
-        // Check the entire sequence range again
-        for (uint32_t seq = 0; seq < totalPackets; ++seq) {
+        for (uint32_t seq = 0; seq < state.totalPackets; seq++) {
             if (!state.receivedFlags[seq].load(std::memory_order_relaxed)) {
                 missingPackets.push_back(seq);
             }
         }
 
-        uint32_t receivedPackets = totalPackets - static_cast<uint32_t>(missingPackets.size());
-        std::cout << "Received DATA packets: " << receivedPackets << " / " << totalPackets << std::endl;
+        std::cout << "Received DATA packets: " << state.receivedCount.load() << " / " << state.totalPackets << std::endl;
         std::cout << "Missing DATA packets: " << missingPackets.size() << std::endl;
 
-        // Everything has arrived
         if (missingPackets.empty()) {
-            auto finalRecvTime = std::chrono::high_resolution_clock::now();
-            auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(finalRecvTime.time_since_epoch()).count();
-            std::cout << "Timestamp (Final bit received): " << duration_us << " us (epoch)" << std::endl;            
-            
+            long long finalRecvTime = state.finalRecvTimeUs.load(std::memory_order_relaxed);
+
+            if (finalRecvTime == 0) {
+                finalRecvTime = current_time_us();
+            }
+
+            std::cout << "Timestamp (Final bit received): " << finalRecvTime << " us (epoch)" << std::endl;
+
             FILE* outputFile = fopen(state.outputFilename.c_str(), "wb");
 
             if (outputFile == nullptr) {
@@ -307,14 +341,9 @@ int main() {
                 break;
             }
 
-            size_t bytesWritten = fwrite(state.fileBuffer.data(), 1, state.fileSize, outputFile);
+            size_t bytesWritten = fwrite(state.fileBuffer.get(), 1, state.fileSize, outputFile);
             fclose(outputFile);
 
-            auto writeCompleteTime = std::chrono::high_resolution_clock::now();
-            auto writeComplete_us = std::chrono::duration_cast<std::chrono::microseconds>(writeCompleteTime.time_since_epoch()).count();
-            
-            std::cout << "Timestamp (File write completed): " << writeComplete_us << " us (epoch)" << std::endl;
-            
             if (bytesWritten != state.fileSize) {
                 std::cerr << "Failed to write complete file." << std::endl;
                 break;
@@ -327,12 +356,14 @@ int main() {
             completePacket.data_length = 0;
 
             ssize_t bytesSent = sendto(
-                repairSock,
+                sockfd,
                 &completePacket,
                 packet_wire_size(completePacket),
                 0,
-                reinterpret_cast<const sockaddr*>(&clientAddr),
-                sizeof(clientAddr)
+                reinterpret_cast<const sockaddr*>(
+                    &state.clientAddress
+                ),
+                sizeof(state.clientAddress)
             );
 
             if (bytesSent < 0) {
@@ -341,59 +372,54 @@ int main() {
             else {
                 std::cout << "All packets received. COMPLETE sent." << std::endl;
             }
+
             break;
         }
 
-        // Tell client which packets are still missing
-        if (!send_nack_packets(repairSock, missingPackets, clientAddr, state.chunkSize)) {
+        if (!send_nack_packets(
+                sockfd,
+                missingPackets,
+                state.clientAddress,
+                state.chunkSize)) {
+
             std::cerr << "Failed to send NACK packets." << std::endl;
             break;
         }
 
         std::cout << "Waiting for retransmitted packets..." << std::endl;
 
-        // Receive only retransmitted DATA packets
         while (true) {
             Packet repairPacket{};
 
-            ssize_t n = recvfrom(repairSock, &repairPacket, sizeof(repairPacket), 0, nullptr, nullptr);
+            ssize_t n = recvfrom(
+                sockfd,
+                &repairPacket,
+                sizeof(repairPacket),
+                0,
+                nullptr,
+                nullptr
+            );
 
             if (n < 0) {
                 if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                    std::cout << "Repair timeout. Rechecking missing packets..." << std::endl;
                     break;
                 }
-
                 perror("recvfrom repair");
                 break;
+            }
+
+            if (static_cast<size_t>(n) <
+                PACKET_HEADER_SIZE) {
+                continue;
             }
 
             if (repairPacket.type != PACKET_DATA) {
                 continue;
             }
-            if (repairPacket.sequence >= totalPackets) {
-                std::cerr << "Invalid retransmitted sequence: " << repairPacket.sequence << std::endl;
-                continue;
-            }
-            if (repairPacket.data_length > state.chunkSize) {
-                std::cerr << "Invalid retransmitted packet length." << std::endl;
-                continue;
-            }
-            if (state.receivedFlags[repairPacket.sequence].load(std::memory_order_relaxed)) {
-                continue;
-            }
-
-            uint64_t offset = static_cast<uint64_t>(repairPacket.sequence) * state.chunkSize;
-
-            std::memcpy(state.fileBuffer.data() + offset, repairPacket.data, repairPacket.data_length);
-
-            bool expected = false;
-            if (state.receivedFlags[repairPacket.sequence].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
-                state.receivedCount.fetch_add(1, std::memory_order_relaxed);
-            }
+            process_data_packet(state, repairPacket);
         }
     }
 
-    close(repairSock);
+    close(sockfd);
     return 0;
 }
