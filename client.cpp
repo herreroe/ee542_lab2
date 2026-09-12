@@ -73,10 +73,6 @@ static bool send_chunk(const std::string& filename, const std::string& serverIP,
         if (bytesSent < 0) {
             perror("send (thread), skipping this packet");
         }
-        if (chunkSize > 256) {
-             std::this_thread::sleep_for(std::chrono::microseconds(chunkSize/6));
-        }
-
         bytesRemaining -= static_cast<uint64_t>(bytesRead);
         sequence++;
     }
@@ -266,7 +262,7 @@ int main(int argc, char* argv[]) {
         }
 
         std::this_thread::sleep_for(
-            std::chrono::milliseconds(50)
+            std::chrono::microseconds(50)
         );
     }
     
@@ -317,9 +313,6 @@ int main(int argc, char* argv[]) {
             for (uint32_t seq : missingSequences) {
                 retransmitCount++;
                 resend_packet(sockfd, args.file_path, seq, fileSize, chunkSize); // send retransmissions
-                if (chunkSize > 256) {
-                     std::this_thread::sleep_for(std::chrono::microseconds(chunkSize/10));
-                }
             }
         }
         else if (response.type == PACKET_COMPLETE) {
