@@ -79,7 +79,6 @@ static bool process_data_packet(ReceiverState& state, const Packet& packet) {
     if (received == state.totalPackets) {
         state.finalRecvTimeUs.store( current_time_us(), std::memory_order_relaxed);
     }
-
     return true;
 }
 
@@ -88,15 +87,7 @@ static void receiver_thread(int sockfd, ReceiverState& state, int threadIndex) {
     int timeoutsAfterEnd = 0;
 
     while (true) {
-        ssize_t n = recvfrom(
-            sockfd,
-            &packet,
-            sizeof(packet),
-            0,
-            nullptr,
-            nullptr
-        );
-
+        ssize_t n = recvfrom(sockfd, &packet, sizeof(packet), 0, nullptr, nullptr);
         if (n < 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
                 if (state.stopRequested.load(std::memory_order_relaxed)) {
@@ -186,12 +177,7 @@ int main() {
     // Give the kernel more room to hold incoming UDP packets.
     int rcvbuf = 32 * 1024 * 1024;
 
-    if (setsockopt(
-            sockfd,
-            SOL_SOCKET,
-            SO_RCVBUF,
-            &rcvbuf,
-            sizeof(rcvbuf)) < 0) {
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
         perror("setsockopt(SO_RCVBUF)");
     }
 
@@ -346,6 +332,19 @@ int main() {
 
             if (bytesWritten != state.fileSize) {
                 std::cerr << "Failed to write complete file." << std::endl;
+                std::cerr << "Expected: " << state.fileSize << " bytes" << std::endl;
+                std::cerr << "Written:  " << bytesWritten << " bytes" << std::endl;
+
+                if (ferror(outputFile)) {
+                    perror("fwrite");
+                }
+
+                fclose(outputFile);
+                break;
+            }
+
+            if (fclose(outputFile) != 0) {
+                perror("fclose");
                 break;
             }
 
