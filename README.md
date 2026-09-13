@@ -19,3 +19,5 @@ https://man7.org/linux/man-pages/man2/connect.2.html
 https://salivity.github.io/udp/article/determine-optimal-mtu-size-for-udp-programmatically
 https://hpc-tutorials.llnl.gov/posix/
 https://en.cppreference.com/cpp/atomic/atomic
+https://en.cppreference.com/cpp/chrono
+https://www.geeksforgeeks.org/data-structures/
