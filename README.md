@@ -2,7 +2,7 @@
 
 ## Instructions
 
-``` make clean all ``
+MAKE / CLEAN ``` make clean all ```
 
 To run the receiver
 ``` ./server ```
